@@ -1,0 +1,1 @@
+~/anaconda3/envs/pytorch/bin/python -u /media/data/coky/OVIS/CMaskTrack-RCNN/train.py /media/data/coky/OVIS/CMaskTrack-RCNN/configs/sipmask/vitae-b_cnp_mem_ms_1x.py --work_dir /media/data/coky/OVIS/CMaskTrack-RCNN/workdir/vitae-b_cnp_mem_roi > /media/data/coky/OVIS/CMaskTrack-RCNN/vitae_cnp_mem_roi.log
