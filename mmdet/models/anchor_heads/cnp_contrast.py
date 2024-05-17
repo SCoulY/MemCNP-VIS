@@ -6,8 +6,8 @@ from mmcv.cnn import normal_init
 from mmdet.core import distance2bbox, bbox_overlaps, force_fp32, multi_apply, multiclass_nms
 from ..builder import build_loss
 from ..registry import HEADS
-from ..utils import bias_init_with_prob, ConvModule, Scale, MemoryN2N, HungarianMatcher
-from mmdet.ops import DeformConv, CropSplit, CropSplitGt, RoIAlign
+from ..utils import bias_init_with_prob, ConvModule, Scale, MemoryN2N
+from mmdet.ops import DeformConv, CropSplit, CropSplitGt
 from ..losses import cross_entropy, accuracy
 import torch.nn.functional as F
 import pycocotools.mask as mask_util
@@ -73,10 +73,6 @@ class CNPContrastHead(nn.Module):
                  feat_channels=256,
                  stacked_convs=4,
                  strides=(4, 8, 16, 32, 64),
-                 regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 512),
-                                 (512, INF)),
-                 center_sampling=False,
-                 center_sample_radius=1.5,
                  loss_cls=dict(
                      type='FocalLoss',
                      use_sigmoid=True,
@@ -97,18 +93,15 @@ class CNPContrastHead(nn.Module):
         self.feat_channels = feat_channels
         self.stacked_convs = stacked_convs
         self.strides = strides
-        self.regress_ranges = regress_ranges
         self.loss_cls = build_loss(loss_cls)
         self.loss_box = build_loss(loss_box)
         self.loss_centerness = build_loss(loss_centerness)
         self.loss_mask = build_loss(loss_mask)
 
-        self.nc = 32 #number of coefficients
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
         self.fp16_enabled = False
-        self.center_sampling = center_sampling
-        self.center_sample_radius = center_sample_radius
+
         self.fpn_strides = [8, 16, 32, 64, 128]
         self.match_coeff = [1.0, 2.0, 10]
         
@@ -438,9 +431,7 @@ class CNPContrastHead(nn.Module):
                     cls_uncert = (1-boxcls.sigmoid()[pos_points, boxtgt[pos_points]-1])
                     box_uncert = (1-bbox_overlaps(unscaled_dt_img[pair_ind[:,0]], gts[pair_ind[:,1]], is_aligned=True))
                     tgt_uncert = cls_uncert + box_uncert
-                    # neg_uncert = sigma_img[neg_points].mean(-1).clamp(max=1)
   
-                
 
             loss_cnp += self.cnp_scoreing_rule(pair_ind, 
                                                 mu_img, 
@@ -605,10 +596,10 @@ class CNPContrastHead(nn.Module):
             sim_intra = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs[:,None,:], 0)  / 0.1 #q,q
             n = sim_intra.size(0)
             sim_intra = sim_intra.flatten()[1:].view(n-1, n+1)[:,:-1].reshape(n, n-1) #q,q-1 keep only off-diagonal
-            sim_intra = sim_intra.topk(min(5, sim_intra.size(1)), dim=1)[0] #q, topk
+            sim_intra = sim_intra.topk(min(5*feat_masks.size(0), sim_intra.size(1)), dim=1)[0] #q, topk
 
             sim_inter = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs_ref[:,None,:], 0) / 0.1 #q,K
-            sim_inter = sim_inter.topk(min(5, sim_inter.size(1)), dim=1)[0] #q, topk
+            sim_inter = sim_inter.topk(min(5*feat_masks.size(0), sim_inter.size(1)), dim=1)[0] #q, topk
 
             sim_neg = torch.cat([sim_intra.flatten(), sim_inter.flatten()], dim=0)  
 
@@ -1102,62 +1093,9 @@ class CNPContrastHead(nn.Module):
                 mask_offset[sel_points] = True
                 pos_points = mask_offset & mask
                 neg_points = ~pos_points & (score<0)
-
-
-        elif mode == 'eccv':
-            with torch.no_grad():
-                mask_offset = closest_offset.new_zeros(closest_offset.shape).bool()
-                sel_points = []
-                for lvl in range(len(points_stages)):
-                    start = 0 if lvl==0 else points_stages[lvl-1]
-                    end = points_stages[lvl]
-                    offset_stage = closest_offset[start:end]
-                    gt_id_stage = closest_gt_ind[start:end]
-                    range_stage = torch.arange(start, end)
-                    for gt_id in gt_id_stage.unique():
-                        gt_points = (gt_id_stage==gt_id)
-                        topk = offset_stage[gt_points].topk(min(4, gt_points.sum()), largest=False)[1]
-                        sel_points.append(range_stage[gt_points][topk])
-                sel_points = torch.cat(sel_points)
-                mask_offset[sel_points] = True
-                pos_points = mask_offset & mask
-                neg_points = ~pos_points 
                 
         elif mode == 'objbox':#strategy from ECCV2022 objectbox
             pos_points = (closest_offset<1.5*2/unscale_factor[None,0]) & mask 
-            neg_points = ~pos_points
-
-        elif mode == 'dynamic' and box_cls is not None and cent_target is not None and cof_preds is not None and gt_label is not None:
-            score = box_cls.sigmoid() * cent_target[:,None]
-            score_0 = score[:points_stages[0]] #num_points, K 
-            score_1 = score[points_stages[0]:points_stages[1]]  #num_points, K
-            score_2 = score[points_stages[1]:points_stages[2]]  #num_points, K
-            score_3 = score[points_stages[2]:]  #num_points, K
-            score_0 = score_0.view(cof_preds[0].shape[2], cof_preds[0].shape[3], -1) #H, W, K
-            score_1 = F.interpolate(score_1.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[1].shape[2], cof_preds[1].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0) #H, W, K
-            score_2 = F.interpolate(score_2.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[2].shape[2], cof_preds[2].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
-            score_3 = F.interpolate(score_3.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[3].shape[2], cof_preds[3].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
-            
-            gt_label =  gt_label[closest_gt_ind[:points_stages[0]].view(-1,1)]-1
-            score_0 = score_0.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-            score_1 = score_1.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-            score_2 = score_2.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-            score_3 = score_3.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-            stage_assign = torch.stack([score_0, score_1, score_2, score_3], dim=1) #points, stages
-
-            stage_mean = stage_assign.mean(1, keepdim=True)
-            stage_assign = (stage_assign >= stage_mean)
-            stage_assign_0 = stage_assign[:,0].flatten()
-            stage_assign_1 = F.interpolate((stage_assign[:,1].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[1].shape[2], cof_preds[1].shape[3]), mode='nearest').bool().flatten()
-            stage_assign_2 = F.interpolate((stage_assign[:,2].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[2].shape[2], cof_preds[2].shape[3]), mode='nearest').bool().flatten()
-            stage_assign_3 = F.interpolate((stage_assign[:,3].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[3].shape[2], cof_preds[3].shape[3]), mode='nearest').bool().flatten()
-
-            pos_0 = (closest_offset[:points_stages[0]]<np.sqrt(2)*2/unscale_factor[None,0]) & stage_assign_0
-            pos_1 = (closest_offset[points_stages[0]:points_stages[1]]<np.sqrt(2)*2**2/unscale_factor[None,0]) & stage_assign_1
-            pos_2 = (closest_offset[points_stages[1]:points_stages[2]]<np.sqrt(2)*2**3/unscale_factor[None,0]) & stage_assign_2
-            pos_3 = (closest_offset[points_stages[2]:]<np.sqrt(2)*2**4/unscale_factor[None,0]) & stage_assign_3
-
-            pos_points = torch.cat([pos_0, pos_1, pos_2, pos_3], dim=0)
             neg_points = ~pos_points
         
         else:
@@ -1218,14 +1156,11 @@ class CNPContrastHead(nn.Module):
             for gt_id in gt_ids[:,1].unique():
                 sup_ind = gt_ids[:,1]==gt_id
                 sup_ind = gt_ids[sup_ind][:,0]
-                # ood_ind = gt_ids[:,1]!=gt_id
-                # ood_ind = gt_ids[ood_ind][:,0]
 
                 dist = Independent(Normal(mu, sigma), 1)
                 log_prob = dist.log_prob(gts[gt_id].unsqueeze(0)) # dt_num
                 loss += -(log_prob[sup_ind].sum())/(log_prob[pos_points].sum()+1e-9).mean()
                 loss /= gt_ids[:,1].numel()
-
 
 
         else:

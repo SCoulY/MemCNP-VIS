@@ -215,17 +215,6 @@ def imshow_det_bboxes_w_uncert(img,
     if show:
         imshow(img, win_name, wait_time)
     if out_file is not None:
-        outer_path = out_file.split('/')[:-2]
-        inner_path = out_file.split('/')[-2]
-        out_file = out_file.replace('.png','.pdf')
-        import os
-        from PIL import Image
-        out_path = os.path.join(*outer_path)
-        in_path = os.path.join(out_path, inner_path)
-        os.makedirs(out_path, exist_ok=True)
-        os.makedirs(in_path, exist_ok=True)
-        img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        img.save(out_file, "PDF", resolution=100.0)
-        # imwrite(img, out_file)
+        imwrite(img, out_file)
 
     

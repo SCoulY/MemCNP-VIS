@@ -57,7 +57,7 @@ fi
 $PYTHON setup.py build_ext --inplace
 
 echo "Building cocoapi..."
-cd /media/data/coky/OVIS/cocoapi/PythonAPI
+cd ..
 if [ -d "build" ]; then
     rm -r build
 fi

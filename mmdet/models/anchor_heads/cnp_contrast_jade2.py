@@ -6,7 +6,7 @@ from mmcv.cnn import normal_init
 from mmdet.core import distance2bbox, bbox_overlaps, force_fp32, multi_apply, multiclass_nms
 from ..builder import build_loss
 from ..registry import HEADS
-from ..utils import bias_init_with_prob, ConvModule, Scale, MemoryN2N
+from ..utils import bias_init_with_prob, ConvModule, Scale, MemoryN2N, HungarianMatcher
 from mmdet.ops import DeformConv, CropSplit, CropSplitGt, RoIAlign
 from ..losses import cross_entropy, accuracy
 import torch.nn.functional as F
@@ -32,7 +32,7 @@ def center_size(boxes):
     return torch.cat(((boxes[:, 2:] + boxes[:, :2]) / 2,  # cx, cy
                       boxes[:, 2:] - boxes[:, :2]), 1)  # w, h
 
-
+    
 class FeatureAlign(nn.Module):
     def __init__(self,
                  in_channels,
@@ -51,7 +51,7 @@ class FeatureAlign(nn.Module):
                                         padding=(kernel_size - 1) // 2,
                                         deformable_groups=deformable_groups)
         self.relu = nn.ReLU(inplace=True)
-        self.norm = nn.GroupNorm(32, in_channels)
+        self.norm = nn.GroupNorm(32, out_channels)
 
     def init_weights(self, bias_value=0):
         torch.nn.init.normal_(self.conv_offset.weight, std=0.01)
@@ -65,7 +65,7 @@ class FeatureAlign(nn.Module):
         return x
 
 @HEADS.register_module
-class SipMaskMemCNPHead(nn.Module):
+class CNPContrastHead(nn.Module):
 
     def __init__(self,
                  num_classes,
@@ -85,10 +85,11 @@ class SipMaskMemCNPHead(nn.Module):
                      loss_weight=1.0),
                  loss_box=dict(type='IoULoss', loss_weight=1.0),
                  loss_centerness=dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0),
+                 loss_mask=dict(type='BCELoss', use_sigmoid=True, loss_weight=1.0),
                  memory_cfg=dict(kdim=128, moving_average_rate=0.999),
                  conv_cfg=None,
                  norm_cfg=dict(type='GN', num_groups=32, requires_grad=True)):
-        super(SipMaskMemCNPHead, self).__init__()
+        super(CNPContrastHead, self).__init__()
 
         self.num_classes = num_classes
         self.cls_out_channels = num_classes - 1
@@ -100,7 +101,9 @@ class SipMaskMemCNPHead(nn.Module):
         self.loss_cls = build_loss(loss_cls)
         self.loss_box = build_loss(loss_box)
         self.loss_centerness = build_loss(loss_centerness)
+        self.loss_mask = build_loss(loss_mask)
 
+        self.nc = 32 #number of coefficients
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
         self.fp16_enabled = False
@@ -113,22 +116,23 @@ class SipMaskMemCNPHead(nn.Module):
         self.prev_roi_feats = None
         self.prev_bboxes = None
         self.prev_det_labels = None
-        self.mem = MemoryN2N(hdim=feat_channels, kdim=memory_cfg['kdim'], 
+        self.mem = MemoryN2N(hdim=self.in_channels, kdim=memory_cfg['kdim'],
                              moving_average_rate=memory_cfg['moving_average_rate'])
 
-        self.nc = 32
-        self.feat_align = FeatureAlign(self.feat_channels, self.feat_channels, 3)
-        self.sip_cof = nn.Conv2d(self.feat_channels, self.nc * 4, 3, padding=1)
-        # self.RoIAlign = RoIAlign(out_size=(3, 3), spatial_scale=1/8, sample_num=0)
+        self.cls_align = FeatureAlign(2*self.feat_channels, self.feat_channels, 3)
+        self.mask_align = FeatureAlign(self.feat_channels, self.feat_channels, 3)
+
         self.fcos_cls = nn.Conv2d(self.feat_channels, self.cls_out_channels, 3, padding=1)
-        self.fcos_reg = nn.Conv2d(2*self.feat_channels+3, 4, 3, padding=1)
-        # self.roi_fc = nn.Linear(self.feat_channels*3*3, self.cls_out_channels)
+        self.fcos_reg = nn.Conv2d(2*self.feat_channels, 8, 3, padding=1)
         self.fcos_centerness = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
+        self.track_fuse = nn.Conv2d(self.feat_channels*3, self.feat_channels, 1, padding=0)
+        self.mask_fuse = nn.Conv2d(self.feat_channels*3, self.feat_channels, 1, padding=0)
+
         self._init_layers()
 
     def _init_layers(self):
         self.cls_convs = nn.ModuleList()
-        self.reg_convs = nn.ModuleList()
+        self.mask_convs = nn.ModuleList()
         for i in range(self.stacked_convs - 1):
             chn = self.in_channels if i == 0 else self.feat_channels
             self.cls_convs.append(
@@ -140,10 +144,12 @@ class SipMaskMemCNPHead(nn.Module):
                     padding=1,
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
+                    activation= 'relu' if i < self.stacked_convs - 2 else None,
                     bias=self.norm_cfg is None))
+            
         for i in range(self.stacked_convs):
             chn = self.in_channels if i == 0 else self.feat_channels
-            self.reg_convs.append(
+            self.mask_convs.append(
                 ConvModule(
                     chn,
                     self.feat_channels,
@@ -153,15 +159,18 @@ class SipMaskMemCNPHead(nn.Module):
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
                     bias=self.norm_cfg is None))
-
+        self.cls_convs = nn.Sequential(*self.cls_convs)
+        self.mask_convs = nn.Sequential(*self.mask_convs)
         self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
 
 
-        self.sip_mask_lat = nn.Conv2d(512, self.nc, 3, padding=1)
-        self.sip_mask_lat0 = nn.Conv2d(768, 512, 1, padding=0)
         self.relu = nn.ReLU(inplace=True)
-        self.crop_cuda = CropSplit(2)
-        self.crop_gt_cuda = CropSplitGt(2)
+        self.crop_gt_cuda = CropSplitGt(1)
+        self.crop_cuda = CropSplit(1)
+
+        for i in range(self.stacked_convs - 1):
+            chn = self.in_channels if i == 0 else self.feat_channels
+  
         self.track_convs = nn.ModuleList()
         for i in range(self.stacked_convs - 1):
             chn = self.in_channels if i == 0 else self.feat_channels
@@ -175,113 +184,122 @@ class SipMaskMemCNPHead(nn.Module):
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
                     bias=self.norm_cfg is None))
-        self.sipmask_track = nn.Conv2d(self.feat_channels * 3, 512, 1, padding=0)
+        self.track_convs = nn.Sequential(*self.track_convs)
+        
 
     def init_weights(self):
         for m in self.cls_convs:
             normal_init(m.conv, std=0.01)
-        for m in self.reg_convs:
+        for m in self.mask_convs:
             normal_init(m.conv, std=0.01)
-
-        normal_init(self.sip_cof, std=0.01)
-        normal_init(self.sip_mask_lat, std=0.01)
-        normal_init(self.sip_mask_lat0, std=0.01)
-        normal_init(self.fcos_centerness, std=0.01)
-        bias_cls = bias_init_with_prob(0.01)
-        normal_init(self.fcos_cls, std=0.01, bias=bias_cls)
-        # normal_init(self.roi_fc, std=0.01)
-        normal_init(self.fcos_reg, std=0.01)
-        self.feat_align.init_weights()
-
         for m in self.track_convs:
             normal_init(m.conv, std=0.01)
 
-    def forward(self, feats, feats_x, flag_train=True):
-        # return multi_apply(self.forward_single, feats, self.scales)
+
+        normal_init(self.fcos_centerness, std=0.01)
+        bias_cls = bias_init_with_prob(0.01)
+        normal_init(self.fcos_cls, std=0.01, bias=bias_cls)
+        normal_init(self.fcos_reg, std=0.01)
+        normal_init(self.track_fuse, std=0.01)
+        normal_init(self.mask_fuse, std=0.01)
+
+        self.cls_align.init_weights()
+        self.mask_align.init_weights()
+
+
+
+    def forward(self, feats, feats_x, gt_bboxes=None, flag_train=True):
         cls_scores = []
         reg_maps = []
         feat_masks = []
         track_feats = []
         track_feats_ref = []
         feat_centers = []
-        cof_preds = []
         rel_pos_maps = []
         count = 0
 
+        shape_h, shape_w = feats[0].shape[2:]
+        unscale_factor = torch.tensor([8*shape_w, 8*shape_h, 8*shape_w, 8*shape_h], 
+                                      dtype=feats[0].dtype, device=feats[0].device) #x,y,x,y
+        ori_img_shape = 8*torch.tensor([shape_w, shape_h], dtype=feats[0].dtype, device=feats[0].device)
         for x, x_f, scale, stride in zip(feats, feats_x, self.scales, self.strides):
             cls_feat = x
-            reg_feat = x
+            mask_feat = x
             track_feat = x
             track_feat_f = x_f
 
-            for cls_layer in self.cls_convs:
-                cls_feat = cls_layer(cls_feat)
+            cls_feat = self.cls_convs(cls_feat)
+            mask_feat = self.mask_convs(mask_feat)
 
-            for reg_layer in self.reg_convs:
-                reg_feat = reg_layer(reg_feat)
+            points = self.get_points(x.shape[2:], stride, x.dtype, x.device)  
+            rel_pos = points/ori_img_shape[None, None, :]
 
             if count < 3:
-                for track_layer in self.track_convs:
-                    track_feat = track_layer(track_feat)
+                track_feat = self.track_convs(track_feat)
                 track_feat = F.interpolate(track_feat, scale_factor=(2 ** count), mode='bilinear', align_corners=False)
                 track_feats.append(track_feat)
                 if flag_train:
-                    for track_layer in self.track_convs:
-                        track_feat_f = track_layer(track_feat_f)
+                    track_feat_f = self.track_convs(track_feat_f)
                     track_feat_f = F.interpolate(track_feat_f, scale_factor=(2 ** count), mode='bilinear',
-                                                 align_corners=False)
+                                                    align_corners=False)
                     track_feats_ref.append(track_feat_f)
 
 
-            context, _ = self.mem(reg_feat, update_flag=self.training) #b,c,h,w
+            if self.training:
+                gts_ltrb, masks = multi_apply(self.get_reg_cls_target_single,
+                                            gt_bboxes, points=points)
+    
+                gts_ltrb = torch.stack(gts_ltrb, dim=0) # batch_size, num_points, 4
+                gts_ltrb = (gts_ltrb/unscale_factor[None, None, :] - 0.5)*2 #normalize to [-1,1]
+                gts_ltrb = gts_ltrb.permute(0, 2, 1).view(x.size(0), 4, x.size(2), x.size(3)) # batch_size, 4, h, w
+                masks = torch.cat(masks) # batch_size*num_points
+                masks = masks if masks.sum() else None
+                context = self.mem(cls_feat, gts_ltrb, masks, update_flag=self.training) #b,c,h,w
+
+            else: # inference
+                context = self.mem(cls_feat, update_flag=self.training) #b,c,h,w
+
+            cls_feat = torch.cat([cls_feat, context], dim=1) #b,in_channels+256,h,w
             
-            
-            centerness = self.fcos_centerness(reg_feat)
+
+            centerness = self.fcos_centerness(mask_feat)
             feat_centers.append(centerness)
-            
-            rel_pos = self.get_points(context.shape[2:], 2**(3+count), context.dtype, context.device) #b,2,h,w
-            ori_img_size = 8*torch.tensor([feats[0].shape[3], feats[0].shape[2]], device=context.device)
-            rel_pos = rel_pos/(ori_img_size[None, None,:])
-            
-            
-            rel_pos_expand = rel_pos.transpose(1,2).view(1, 2, context.size(2), context.size(3)).repeat(context.size(0), 1, 1, 1)
-            context = torch.cat([context, rel_pos_expand, centerness], dim=1) #b,c+3,h,w
-            reg_map = self.fcos_reg(context) #b,4,h,w
-            # cls_feat = self.feat_align(cls_feat, scale(reg_map[:,:4]*unscale_factor[None,:,None,None]))
+
+            reg_map = self.fcos_reg(cls_feat) #b,8,h,w
+
+            cls_feat = self.cls_align(cls_feat, scale(reg_map[:, :4].sigmoid() * unscale_factor[None, :, None, None]/stride))
+            mask_feat = self.mask_align(mask_feat, scale(reg_map[:, :4].sigmoid() * unscale_factor[None, :, None, None]/stride))
+
             cls_scores.append(self.fcos_cls(cls_feat))
             reg_maps.append(reg_map)
             rel_pos_maps.append(rel_pos)
-            ########COFFECIENTS###############
-            cof_pred = self.sip_cof(cls_feat)
-            cof_preds.append(cof_pred)
 
-            # ################contextual enhanced##################
             if count < 3:
-                feat_up = F.interpolate(reg_feat, scale_factor=(2 ** count), mode='bilinear', align_corners=False)
+                # ################contextual enhanced##################
+                feat_up = F.interpolate(mask_feat, scale_factor=(2 ** count), mode='bilinear', align_corners=False)
                 feat_masks.append(feat_up)
                 count = count + 1
 
         # ################contextual enhanced##################
         feat_masks = torch.cat(feat_masks, dim=1)
-        feat_masks = self.relu(self.sip_mask_lat(self.relu(self.sip_mask_lat0(feat_masks))))
         feat_masks = F.interpolate(feat_masks, scale_factor=4, mode='bilinear', align_corners=False)
+        feat_masks = self.relu(self.mask_fuse(feat_masks))
 
         track_feats = torch.cat(track_feats, dim=1)
-        track_feats = self.sipmask_track(track_feats)
+        track_feats = self.track_fuse(track_feats)
 
         if flag_train:
             track_feats_ref = torch.cat(track_feats_ref, dim=1)
-            track_feats_ref = self.sipmask_track(track_feats_ref)
-            return cls_scores, reg_maps, rel_pos_maps, cof_preds, feat_centers, feat_masks, track_feats, track_feats_ref
+            track_feats_ref = self.track_fuse(track_feats_ref)
+            return cls_scores, reg_maps, rel_pos_maps, feat_centers, feat_masks, track_feats, track_feats_ref
         else:
-            return cls_scores, reg_maps, rel_pos_maps, cof_preds, feat_centers, feat_masks, track_feats, track_feats
+            return cls_scores, reg_maps, rel_pos_maps, feat_centers, feat_masks, track_feats, track_feats
 
     @force_fp32(apply_to=('feat_masks'))
     def loss(self,
              cls_scores,
              reg_maps,
              rel_pos_maps,
-             cof_preds,
              feat_centers,
              feat_masks,
              track_feats,
@@ -299,20 +317,16 @@ class SipMaskMemCNPHead(nn.Module):
         shape_h, shape_w = feat_masks.shape[2:]
         unscale_factor = torch.tensor([shape_w, shape_h, shape_w, shape_h], 
                                       dtype=feat_masks.dtype, device=feat_masks.device) #x,y,x,y
+        
+        first_stage_shape = reg_maps[0].shape[2:]
 
-        first_stage_shape = cof_preds[0].shape[2:]
-
-        points = self.get_points(first_stage_shape, 8, cof_preds[0].dtype, cof_preds[0].device)
+        points = self.get_points(first_stage_shape, 8, reg_maps[0].dtype, reg_maps[0].device)
 
                 
         combined_center_feats = [feat_center.flatten(2)
             for feat_center in feat_centers
             ]
-
-        combined_cof_preds = [
-            cof_pred.flatten(2)
-            for cof_pred in cof_preds
-        ]
+    
 
         combined_cls_scores = [
             score.flatten(2)
@@ -323,28 +337,18 @@ class SipMaskMemCNPHead(nn.Module):
                 reg_map.flatten(2)
             for reg_map in reg_maps]
         
+        
         rel_pos_maps = torch.cat(rel_pos_maps, 1)
         
         combined_center_feats = torch.cat(combined_center_feats, dim=-1) #N,1,num_points
-        combined_cof_preds = torch.cat(combined_cof_preds, dim=-1) #N,C,num_points
         combined_cls_scores = torch.cat(combined_cls_scores, dim=-1) #N,K,num_points
-        combined_reg_map = torch.cat(combined_reg_map, dim=-1) #N,4,num_points
+        combined_reg_map = torch.cat(combined_reg_map, dim=-1) #N,8,num_points
         
-        mu = combined_reg_map.transpose(1,2).sigmoid() #N, num_dt, 4 (ltrb)
-        # sigma = 1-combined_cls_scores.sigmoid().max(1)[0]/combined_cls_scores.sigmoid().sum(1) #N, num_dt
-        # sigma = 0.1 + 0.9 * sigma
-
-        # sigma = sigma[:,:,None].repeat(1,1,4) #N, num_dt, 4
-
-        scaled_dt = self.ltrb2xyxy(rel_pos_maps, mu) # N, num_dt, 4
-        # sigma = 0.1 + 0.9 * F.softplus(sigma)
+        mu = combined_reg_map[:,:4,:].transpose(1,2).sigmoid() #N, num_dt, 4 (ltrb)
+        sigma = combined_reg_map[:,4:,:].transpose(1,2) #N, num_dt, 4
+        scaled_dt = self.ltrb2xyxy(rel_pos_maps, mu) # N, num_dt, 4 (xyxy)
+        sigma = 0.1 + 0.9 * F.softplus(sigma)
         unscaled_dt = scaled_dt * 2*unscale_factor[None,None,:] # N, num_dt, 4
-        ious = []
-        for i in range(unscaled_dt.size(0)): 
-            ious.append(bbox_overlaps(unscaled_dt[i], gt_bboxes[i], is_aligned=False).max(-1)[0]) #num_dt
-        ious = torch.stack(ious, dim=0)
-        sigma = 1-ious
-        sigma = sigma[:,:,None].repeat(1,1,4) #N, num_dt, 4
 
         loss_centerness = 0
         loss_cnp = 0
@@ -353,29 +357,33 @@ class SipMaskMemCNPHead(nn.Module):
         matched_num = []
         matched_ids = {}
 
-        points_stages = [cof.shape[2]*cof.shape[3] for cof in cof_preds]
+        points_stages = [x.shape[2]*x.shape[3] for x in reg_maps]
         points_stages = list(accumulate(points_stages))
 
+
         for img_id in range(mu.size(0)):
-            mu_img = mu[img_id] #num_dt, 4
+            mu_img = scaled_dt[img_id] #num_dt, 4
             sigma_img = sigma[img_id] #num_dt, 4
-            cent_map_img = combined_center_feats[img_id].sigmoid().squeeze(0)
             unscaled_dt_img = unscaled_dt[img_id]
-            # scaled_dt_img = scaled_dt[img_id]
+            scaled_dt_img = scaled_dt[img_id]
             gts = gt_bboxes[img_id] #num_gt, 4
             if not gts.size(0):
                 continue
 
             matched_id = [[],[]]
-            cent_target = combined_center_feats.new_zeros(combined_center_feats[img_id].size(), requires_grad=False)
+            tgt_uncert = None
+
             with torch.no_grad():
-                ltrb_target = self.xyxy2ltrb(gts, points) # num_points, num_gt, 4
-                cent_ori = self.centerness_target(ltrb_target) # num_points, 1
+                gts_ltrb = self.xyxy2ltrb(gts, points) # num_points, num_gt, 4
+                cent_ori = self.centerness_target(gts_ltrb) # num_points, 1
                 cent_ori = cent_ori.view(1,1,first_stage_shape[0],first_stage_shape[1]) # 1,1,H,W
-                cent_2x_down = F.interpolate(cent_ori, size=cof_preds[1].shape[2:], mode='bilinear', align_corners=False).flatten() # H/2,W/2
-                cent_4x_down = F.interpolate(cent_ori, size=cof_preds[2].shape[2:], mode='bilinear', align_corners=False).flatten() # H/4,W/4
-                cent_8x_down = F.interpolate(cent_ori, size=cof_preds[3].shape[2:], mode='bilinear', align_corners=False).flatten() # H/8,W/8
-                cent_target = torch.cat([cent_ori.flatten(), cent_2x_down, cent_4x_down, cent_8x_down]) #total_num_points
+
+                cent_target = [cent_ori.flatten()]
+                for stage in range(1, len(self.strides)):
+                    cent_down = F.interpolate(cent_ori, size=reg_maps[stage].shape[2:], mode='bilinear', align_corners=False).flatten() # H/2,W/2
+                    cent_target.append(cent_down)
+
+                cent_target = torch.cat(cent_target) #total_num_points
 
                 points_in = rel_pos_maps[0].unsqueeze(1)*(2*unscale_factor[None,:2])
                 points_in = points_in.repeat(1, gts.size(0), 1)
@@ -388,20 +396,12 @@ class SipMaskMemCNPHead(nn.Module):
                 # collect points that are within a bounding box.
                 mask = c1.float() + c2.float() + c3.float() + c4.float()
                 mask = (mask==4).sum(dim=-1).bool()
-                # mask = torch.from_numpy(gt_masks_list[img_id]).to(cent_target.device).float() # num_semantic_channels, H, W
-                # mask1 = F.interpolate(mask.unsqueeze(0), size=cof_preds[0].shape[2:], mode='bilinear').squeeze(0).sum(0).flatten()
-                # mask2 = F.interpolate(mask.unsqueeze(0), size=cof_preds[1].shape[2:], mode='bilinear').squeeze(0).sum(0).flatten()
-                # mask3 = F.interpolate(mask.unsqueeze(0), size=cof_preds[2].shape[2:], mode='bilinear').squeeze(0).sum(0).flatten()
-                # mask4 = F.interpolate(mask.unsqueeze(0), size=cof_preds[3].shape[2:], mode='bilinear').squeeze(0).sum(0).flatten()
-                # mask = torch.cat([mask1, mask2, mask3, mask4]) >= 1 #total_num_points
                 
                 gts_cent = (gts[:,:2] + gts[:,2:])/2 /(2*unscale_factor[None,:2]) #num_gt, 2
-                gt_l = (gts[:, 2]-gts[:, 0])/(2*unscale_factor[None,0]) #num_gt
-                gt_t = (gts[:, 3]-gts[:, 1])/(2*unscale_factor[None,1]) #num_gt
-                # pos_map_unnorm = rel_pos_maps[0] * 2*unscale_factor[None,:2]  #num_dt, 2
-                off_l = (rel_pos_maps[0][:,None,0] - gts_cent[None,:,0]) #num_dt, num_gt
-                off_t = (rel_pos_maps[0][:,None,1] - gts_cent[None,:,1]) #num_dt, num_gt
-                off_dist = torch.sqrt(off_l**2 + off_t**2) #num_dt, num_gt
+
+                off_x = (rel_pos_maps[0][:,None,0] - gts_cent[None,:,0]) * unscale_factor[0] #num_dt, num_gt
+                off_y = (rel_pos_maps[0][:,None,1] - gts_cent[None,:,1]) * unscale_factor[1] #num_dt, num_gt
+                off_dist = torch.sqrt(off_x**2 + off_y**2) #num_dt, num_gt
                 closest_offset, closest_gt_ind = off_dist.min(1) #num_dt
 
                 pos_points, neg_points = self.assigner(closest_offset,
@@ -409,17 +409,16 @@ class SipMaskMemCNPHead(nn.Module):
                                             unscale_factor,
                                             mask,
                                             points_stages,
+                                            sigma_img.mean(-1),
                                             combined_cls_scores[img_id].transpose(0,1),
+                                            unscaled_dt_img,
+                                            gt_bboxes[img_id],
                                             cent_target,
-                                            cof_preds,
                                             gt_labels[img_id],
-                                            gt_l,
-                                            gt_t,
-                                            sigma_img,
-                                            mode='uncertainty')
+                                            mode=cfg.assigner.type)
 
                 gt_ind = closest_gt_ind[pos_points] #num_val_dt
-                dt_ind = torch.arange(off_l.size(0), device=off_l.device)[pos_points] #num_val_dt
+                dt_ind = torch.arange(off_x.size(0), device=off_x.device)[pos_points] #num_val_dt
                 pair_ind = torch.cat([dt_ind[:,None], gt_ind[:,None]], dim=1)
                 matched_num.append(pair_ind.size(0))
 
@@ -433,18 +432,25 @@ class SipMaskMemCNPHead(nn.Module):
                 boxcls = combined_cls_scores[img_id].transpose(0,1) #num_points, K
                 boxtgt = pos_points.new_zeros(unscaled_dt_img.size(0), dtype=torch.long, requires_grad=False) #num_dt
                 boxtgt[pos_points] = gt_labels[img_id][pair_ind[:,1]] #num_pos
-                loss_cls += self.loss_cls(boxcls[pos_neg_points], boxtgt[pos_neg_points])
-
+                loss_cls += self.loss_cls(boxcls[pos_neg_points], boxtgt[pos_neg_points])/pos_points.sum()
+                
+                with torch.no_grad():
+                    cls_uncert = (1-boxcls.sigmoid()[pos_points, boxtgt[pos_points]-1])
+                    box_uncert = (1-bbox_overlaps(unscaled_dt_img[pair_ind[:,0]], gts[pair_ind[:,1]], is_aligned=True))
+                    tgt_uncert = cls_uncert + box_uncert
+                    # neg_uncert = sigma_img[neg_points].mean(-1).clamp(max=1)
+  
+                
 
             loss_cnp += self.cnp_scoreing_rule(pair_ind, 
                                                 mu_img, 
                                                 sigma_img, 
                                                 cent_target, 
+                                                tgt_uncert,
                                                 gts/(2*unscale_factor[None,:]), 
-                                                mask,
+                                                pos_points,
                                                 mode='GMM')
  
-            # closest_pair_ind = [(off_dist).min(0)[1], torch.arange(off_l.size(1), device=off_l.device)]
             matched_ids[img_id] = (pair_ind[...,0], pair_ind[...,1])
 
             if mask.sum():
@@ -464,7 +470,7 @@ class SipMaskMemCNPHead(nn.Module):
             loss_bbox = feat_masks[0].sum() * 0
 
         if torch.is_tensor(loss_cls):
-            loss_cls = loss_cls/sum(matched_num)
+            loss_cls = loss_cls/len(matched_num)
         else:
             loss_cls = feat_masks[0].sum() * 0
 
@@ -478,21 +484,23 @@ class SipMaskMemCNPHead(nn.Module):
             gt_label = gt_labels[i]
             gt_masks.append(
                 torch.from_numpy(np.array(gt_masks_list[i][:gt_label.shape[0]], dtype=np.float32)).to(gt_label.device))
-
+        
         loss_match = 0
         loss_seg = 0
         match_acc = 0
         n_total = 0
         mask_shape_list = []
+        pos_pairs = []
+        neg_vecs = []
+        neg_vecs_ref = []
 
         for i, matched_id in matched_ids.items():#per image
             matched_dt_ids, matched_gt_ids = matched_id
-            bbox_dt = unscaled_dt[i][matched_dt_ids, :] / 2
+            bbox_dt = unscaled_dt[i][matched_dt_ids, :]/2
             bbox_gt = gt_bboxes[i][matched_gt_ids, :]
             cur_ids = gt_pids_list[i][matched_gt_ids]
 
             bbox_dt = bbox_dt.detach()
-
             img_mask = feat_masks[i]
             mask_shape_list.append(img_mask.shape[-2:])
             mask_h = img_mask.shape[1]
@@ -510,50 +518,45 @@ class SipMaskMemCNPHead(nn.Module):
             bbox_dt = bbox_dt[idx_gt]
             cur_ids = cur_ids[idx_gt] #num_dt_boxes, 1
 
+
             if bbox_dt.shape[0] == 0:
                 continue
             
             #######spp###########################
-            matched_gt_masks = gt_masks[i][matched_gt_ids][idx_gt]
-            gt_mask = F.interpolate(matched_gt_masks.unsqueeze(0), scale_factor=0.5, mode='bilinear',
+            gt_mask = gt_masks[i][matched_gt_ids][idx_gt]
+            gt_mask = F.interpolate(gt_mask.unsqueeze(0), scale_factor=0.5, mode='bilinear',
                                 align_corners=False).squeeze(0)
 
             shape = np.minimum(feat_masks[i].shape, gt_mask.shape)
             gt_mask_new = gt_mask.new_zeros(gt_mask.shape[0], mask_h, mask_w)
             gt_mask_new[:gt_mask.shape[0], :shape[1], :shape[2]] = gt_mask[:gt_mask.shape[0], :shape[1], :shape[2]]
-            gt_mask_new = gt_mask_new.gt(0.5).float()
+            gt_mask_new = gt_mask_new.gt(0.5).float().contiguous() #num_dt_boxes,h,w
 
-            gt_mask_new = gt_mask_new.permute(1, 2, 0).contiguous()
-            img_mask1 = img_mask.permute(1, 2, 0)
+
             ###calculate instance independent coefficient and cls_score
             bbox_gt = bbox_gt[idx_gt]
             ious = bbox_overlaps(bbox_gt/2, bbox_dt, is_aligned=True) #num_dt_boxes
             ins_labels = gt_labels[i][matched_gt_ids][idx_gt]- 1
-            box_scores = combined_cls_scores[i].transpose(0,1)[matched_dt_ids][idx_gt, ins_labels]
+            box_scores = combined_cls_scores[i].transpose(0,1)[matched_dt_ids][idx_gt, ins_labels].detach()
             weighting = ious * box_scores.sigmoid()
             weighting = weighting / (torch.sum(weighting) + 0.0001) * len(weighting)
-            # cof_pred = [combined_cof_preds[i][:, ((box[1]+box[3])/2).round().long(), ((box[0]+box[2])/2).round().long()] 
-            #             for box in bbox_dt/4]
-            # cof_pred = torch.stack(cof_pred, dim=0) #num_dt_boxes, C
 
-            cof_pred = combined_cof_preds[i].transpose(0,1) 
-            cof_pred = cof_pred[matched_dt_ids][idx_gt] #num_dt_boxes, C
+            ###track feats as mask coef###
+            coefs = self.extract_box_feature_center_single(track_feats[i], bbox_dt * 2) #num_dt_boxes,c
 
-            pos_masks00 = torch.sigmoid(img_mask1 @ cof_pred[:, 0:32].t())
-            pos_masks01 = torch.sigmoid(img_mask1 @ cof_pred[:, 32:64].t())
-            pos_masks10 = torch.sigmoid(img_mask1 @ cof_pred[:, 64:96].t())
-            pos_masks11 = torch.sigmoid(img_mask1 @ cof_pred[:, 96:128].t())
-            pred_masks = torch.stack([pos_masks00, pos_masks01, pos_masks10, pos_masks11], dim=0)
-            pred_masks = self.crop_cuda(pred_masks, bbox_dt)
-            gt_mask_crop = self.crop_gt_cuda(gt_mask_new, bbox_dt)
-            pre_loss = F.binary_cross_entropy(pred_masks, gt_mask_crop, reduction='none')
-            
+            pred_mask = torch.sigmoid(img_mask.permute(1,2,0).contiguous() @ coefs.T) #h,w,num_dt_boxes
+            gt_mask_new = gt_mask_new.permute(1,2,0).contiguous() #h,w,num_dt_boxes
+            pred_masks_crop = self.crop_cuda(pred_mask.unsqueeze(0), bbox_dt)
+            gt_masks_crop = self.crop_gt_cuda(gt_mask_new, bbox_dt) 
+
+            # pred_masks_crop = self.crop_feat(pred_mask, bbox_dt) #num_dt_boxes, points
+            # gt_masks_crop = self.crop_feat(gt_mask_new, bbox_dt) #num_dt_boxes, points
             pos_get_csize = center_size(bbox_dt)
             gt_box_width = pos_get_csize[:, 2]
             gt_box_height = pos_get_csize[:, 3]
-            pre_loss = pre_loss.sum(dim=(0, 1)) / gt_box_width / gt_box_height / pos_get_csize.shape[0]
-            loss_seg += torch.sum(pre_loss * weighting.detach())
+            weighted_loss_seg = F.binary_cross_entropy(pred_masks_crop, gt_masks_crop, reduction='none').sum((0,1)) / gt_box_width / gt_box_height / pos_get_csize.shape[0]
 
+            loss_seg += (weighted_loss_seg * weighting.detach()).sum()
             ###################track####################
             bboxes = ref_bboxes_list[i]
             amplitude = 0.05
@@ -570,22 +573,56 @@ class SipMaskMemCNPHead(nn.Module):
             new_x2y2 = (new_cxcy + new_wh / 2)
             new_bboxes = torch.cat([new_x1y1, new_x2y2], dim=1)
 
-            track_feat_i = self.extract_box_feature_center_single(track_feats[i], bbox_dt * 2)
-            track_box_ref = self.extract_box_feature_center_single(track_feats_ref[i], new_bboxes)
+            track_vec_i = coefs.T #c,q
+            track_vec_i_unique = self.extract_box_feature_center_single(track_feats[i], gt_bboxes[i]).T
+            track_vec_ref = self.extract_box_feature_center_single(track_feats_ref[i], new_bboxes).T #c,k
 
-            prod = torch.mm(track_feat_i, torch.transpose(track_box_ref, 0, 1))
-            m = prod.size(0)
-            dummy = torch.zeros(m, 1, device=torch.cuda.current_device())
+            for id, ref_id in enumerate(gt_pids_list[i]):
+                if ref_id:
+                    pos_pairs.append(torch.stack([track_vec_i_unique[:,id], track_vec_ref[:,ref_id-1]], dim=1)) 
+               
+            neg_vecs.append(track_vec_i_unique) #c,q
+            neg_vecs_ref.append(track_vec_ref) #c,k
 
-            prod_ext = torch.cat([dummy, prod], dim=1)
-            loss_match += cross_entropy(prod_ext, cur_ids)
+            dummy = track_vec_i.new_zeros(track_vec_i.size(1),1) #q,1
+            # sim_mat = torch.mm(track_vec_i.T, track_vec_ref) #q,k
+            sim_mat = F.cosine_similarity(track_vec_i[:,:,None], track_vec_ref[:,None,:], 0)/0.1 #q,k
+            sim_mat = torch.cat([dummy, sim_mat], dim=1) #q,k+1
+            
             n_total += len(idx_gt)
-            match_acc += accuracy(prod_ext, cur_ids) * len(idx_gt)
+            match_acc += accuracy(sim_mat, cur_ids) * len(idx_gt)
+            # loss_match += cross_entropy(sim_mat, cur_ids)
+
+        if len(pos_pairs):
+            pos_pairs = torch.stack(pos_pairs, dim=0) #Q,c,2
+            sim_pos = F.cosine_similarity(pos_pairs[:,:,0], pos_pairs[:,:,1], 1) / 0.1
+        else:
+            sim_pos = feat_masks.new_ones(feat_masks.size(0)) / 0.1
+        
+        if len(neg_vecs) and len(neg_vecs_ref):
+            neg_vecs = torch.cat(neg_vecs, dim=1) #c,Q
+            neg_vecs_ref = torch.cat(neg_vecs_ref, dim=1) #c,K
+            
+            sim_intra = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs[:,None,:], 0)  / 0.1 #q,q
+            n = sim_intra.size(0)
+            sim_intra = sim_intra.flatten()[1:].view(n-1, n+1)[:,:-1].reshape(n, n-1) #q,q-1 keep only off-diagonal
+            sim_intra = sim_intra.topk(min(5, sim_intra.size(1)), dim=1)[0] #q, topk
+
+            sim_inter = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs_ref[:,None,:], 0) / 0.1 #q,K
+            sim_inter = sim_inter.topk(min(5, sim_inter.size(1)), dim=1)[0] #q, topk
+
+            sim_neg = torch.cat([sim_intra.flatten(), sim_inter.flatten()], dim=0)  
+
+        else:
+            sim_neg = feat_masks.new_ones(feat_masks.size(0)) / 0.1
+        
+
+        loss_match = -torch.log(torch.exp(sim_pos).sum()/torch.exp(sim_neg).sum())
 
         if torch.is_tensor(loss_seg):
             loss_seg = loss_seg/len(matched_num)
         else:
-            loss_seg = feat_masks[0].sum() * 0
+            loss_seg = feat_masks.sum() * 0
 
         if match_acc ==0:
             match_acc = feat_masks.sum()*0
@@ -635,7 +672,6 @@ class SipMaskMemCNPHead(nn.Module):
                    cls_scores,
                    reg_maps,
                    rel_pos_maps,
-                   cof_preds,
                    feat_centers,
                    feat_masks,
                    track_feats,
@@ -650,16 +686,9 @@ class SipMaskMemCNPHead(nn.Module):
         unscale_factor = torch.tensor([shape_w, shape_h, shape_w, shape_h], 
                                       dtype=feat_masks.dtype, device=feat_masks.device) #x,y,x,y
 
-        first_stage_shape = (shape_h//4, shape_w//4)
-
         combined_center_feats = [feat_center.flatten(2)
             for feat_center in feat_centers
             ]
-
-        combined_cof_preds = [
-            cof_pred.flatten(2)
-            for cof_pred in cof_preds
-        ]
 
         combined_cls_scores = [
             score.flatten(2)
@@ -669,10 +698,11 @@ class SipMaskMemCNPHead(nn.Module):
         combined_reg_map = [
                 reg_map.flatten(2)
             for reg_map in reg_maps]
+        
+        points_stages = [x.numel() for x in combined_center_feats]
 
 
         combined_center_feats = torch.cat(combined_center_feats, dim=-1).squeeze(1) #N,num_points
-        combined_cof_preds = torch.cat(combined_cof_preds, dim=-1) #N,C,num_points
         combined_cls_scores = torch.cat(combined_cls_scores, dim=-1) #N,K,num_points
         combined_reg_map = torch.cat(combined_reg_map, dim=-1) #N,8,num_points
 
@@ -686,7 +716,7 @@ class SipMaskMemCNPHead(nn.Module):
 
 
         for img_id in range(unscaled_dt.size(0)):
-            track_feat_list = track_feats[img_id]
+            track_feat_img = track_feats[img_id]
             is_first = img_metas[img_id]['is_first']
 
             img_shape = img_metas[img_id]['img_shape']
@@ -698,7 +728,8 @@ class SipMaskMemCNPHead(nn.Module):
                                                 combined_cls_scores[img_id], 
                                                 combined_center_feats[img_id], 
                                                 feat_masks[img_id], 
-                                                combined_cof_preds[img_id],
+                                                track_feat_img,
+                                                points_stages,
                                                 img_shape, 
                                                 ori_shape,
                                                 scale_factor, 
@@ -713,7 +744,9 @@ class SipMaskMemCNPHead(nn.Module):
             if rescale:
                 res_det_bboxes[:, :4] *= scale_factor
 
-            det_roi_feats = self.extract_box_feature_center_single(track_feat_list, res_det_bboxes[:, :4])
+            bbox_cent = (res_det_bboxes[:, :2] + res_det_bboxes[:, 2:4])/2 / self.strides[0] #8x downscale to match track feature
+            det_roi_feats = track_feat_img[:, torch.round(bbox_cent[:,1]).long(), torch.round(bbox_cent[:,0]).long()] #c,n
+            det_roi_feats = det_roi_feats.transpose(0,1) #n,c
 
             # recompute bbox match feature
             det_labels = det_bboxes[1]
@@ -727,9 +760,8 @@ class SipMaskMemCNPHead(nn.Module):
 
                 assert self.prev_roi_feats is not None
                 # only support one image at a time
-                prod = torch.mm(det_roi_feats, torch.transpose(self.prev_roi_feats, 0, 1))
-                m = prod.size(0)
-                dummy = torch.zeros(m, 1, device=torch.cuda.current_device())
+                prod = F.cosine_similarity(det_roi_feats[:,None,:], self.prev_roi_feats[None,:,:], dim=-1)/0.1 #n,m
+                dummy = torch.zeros(prod.size(0), 1, device=torch.cuda.current_device())
                 match_score = torch.cat([dummy, prod], dim=1)
                 match_logprob = torch.nn.functional.log_softmax(match_score, dim=1)
                 label_delta = (self.prev_det_labels == det_labels.view(-1, 1)).float()
@@ -788,7 +820,8 @@ class SipMaskMemCNPHead(nn.Module):
                           cls_scores,
                           feat_centers,
                           feat_mask,
-                          cof_preds,
+                          feat_track,
+                          points_stages,
                           img_shape,
                           ori_shape,
                           scale_factor,
@@ -800,63 +833,65 @@ class SipMaskMemCNPHead(nn.Module):
         cls_scores: (C,N)
         feat_centers: (N)
         feat_mask: (C,H//2,W//2)
-        cof_preds: (nc, N)
+        feat_track: (C,H//8,W//8)
+        points_stages: (N1, N2, N3, N4)
         '''
         cls_scores = cls_scores.transpose(0,1).sigmoid() # (N,C)
         dt_boxes = dt_boxes #num_points, 4 
-        uncertainty = uncertainty.mean(-1) #num_points
         centerness = feat_centers.flatten().sigmoid() #num_points
-        # ct1 = uncertainty < uncertainty.mean() #num_points criterion 1 to filter out points
-        # ct1 = cls_scores.max(1)[0] > 0.5 #num_points criterion 1 to filter out points
-        # ct2 = centerness > 0.5 #num_points criterion 2 to filter out points
-        # import pdb; pdb.set_trace()
-        # winning_ind = ct2 #num_points
-        # uncertainty = uncertainty[winning_ind] #num_points
-        # dt_boxes = dt_boxes[winning_ind] #num_points, 4
-        # centerness = centerness[winning_ind] #num_points
-        # cls_scores = cls_scores[winning_ind] #num_points, C
-
         det_bboxes = dt_boxes
-        det_uncert = uncertainty
+        det_uncert = uncertainty.clamp(max=1) #num_points, 4
 
         if not det_bboxes.size(0):
             return det_bboxes, det_bboxes, det_bboxes
 
         ###eliminate unconfident detections before NMS###
-        max_scores = (cls_scores * centerness[:, None]).max(1)[0] #num_dt_boxes
-        true_dets = (max_scores).sort(descending=True)[1][:cfg.max_pre_nms]
-        # true_dets = true_dets[box_cents[true_dets]>0.5]
-        box_cents = centerness[true_dets]
-        # det_labels = det_labels[true_dets] 
-        det_bboxes = det_bboxes[true_dets]
-        # max_score = max_score[true_dets]
-        det_uncert = det_uncert[true_dets]
-        box_scores = cls_scores[true_dets]
+        stage_scores = cls_scores.split(points_stages, dim=0) #num_stages, num_dt_boxes, C
+        stage_cents = centerness.split(points_stages, dim=0) #num_stages, num_dt_boxes
+        stage_bboxs = det_bboxes.split(points_stages, dim=0) #num_stages, num_dt_boxes, 4
+        stage_uncert = det_uncert.split(points_stages, dim=0) #num_stages, num_dt_boxes, 4
 
-        ###calculate instance independent coefficient, cls_score and center_score
-        cof_pred = cof_preds.transpose(0,1)
-        cof_pred = cof_pred[true_dets] #num_dt_boxes, C
+        mlvl_cents = []
+        mlvl_scores = []
+        mlvl_bboxs = []
+        mlvl_uncert = []
+        for i in range(len(stage_scores)):
+            cls_scores = stage_scores[i]
+            centerness = stage_cents[i]
+            det_bboxes = stage_bboxs[i]
+            det_uncert = stage_uncert[i]
 
+            max_scores, _ = (cls_scores * centerness[:, None]).max(dim=1)
+            _, top_ind = max_scores.topk(min(cfg.max_pre_nms,cls_scores.size(0)))
+            box_cents = centerness[top_ind]
+            det_bboxes = det_bboxes[top_ind]
+            det_uncert = det_uncert[top_ind]
+            box_scores = cls_scores[top_ind]
 
-        combined_scores = box_scores * box_cents[:, None] #num_dt_boxes, C
-        det_bboxes, det_labels, cof_pred, idx = self.fast_nms(det_bboxes, combined_scores.transpose(1, 0), cof_pred, cfg)
+            mlvl_bboxs.append(det_bboxes)
+            mlvl_scores.append(box_scores)
+            mlvl_cents.append(box_cents)
+            mlvl_uncert.append(det_uncert)
+
+        mlvl_scores = torch.cat(mlvl_scores, dim=0)
+        mlvl_cents = torch.cat(mlvl_cents, dim=0)
+        mlvl_bboxs = torch.cat(mlvl_bboxs, dim=0)
+        mlvl_uncert = torch.cat(mlvl_uncert, dim=0)
+
+        combined_scores = mlvl_scores * mlvl_cents[:, None] #num_dt_boxes, C
+        det_bboxes, det_labels, idx = self.fast_nms(mlvl_bboxs, combined_scores.transpose(0,1), cfg)
         # each det_box is of shape [x1,y1,x2,y2,score,uncert,centerness]
-        det_bboxes = torch.cat([det_bboxes, det_uncert[idx].unsqueeze(1), box_cents[idx].unsqueeze(1)], dim=1) 
+        det_bboxes = torch.cat([det_bboxes, mlvl_uncert[idx], mlvl_cents[idx].unsqueeze(1)], dim=1) 
 
-        
+ 
         masks = []
         if det_bboxes.shape[0] > 0:
             scale = 2
             #####spp########################
-            img_mask1 = feat_mask.permute(1, 2, 0)
-            pos_masks00 = torch.sigmoid(img_mask1 @ cof_pred[:, 0:32].t())
-            pos_masks01 = torch.sigmoid(img_mask1 @ cof_pred[:, 32:64].t())
-            pos_masks10 = torch.sigmoid(img_mask1 @ cof_pred[:, 64:96].t())
-            pos_masks11 = torch.sigmoid(img_mask1 @ cof_pred[:, 96:128].t())
-            pos_masks = torch.stack([pos_masks00, pos_masks01, pos_masks10, pos_masks11], dim=0)
-
-            pos_masks = self.crop_cuda(pos_masks, det_bboxes[:, :4]/scale)
- 
+            cof_pred = self.extract_box_feature_center_single(feat_track, det_bboxes[:,:4]).T #c,num_dt_boxes
+            img_mask = feat_mask.permute(1, 2, 0)
+            pred_mask = torch.sigmoid(img_mask.contiguous() @ cof_pred) #h,w,num_dt_boxes
+            pos_masks = self.crop_cuda(pred_mask.unsqueeze(0), det_bboxes[:, :4]/scale)
             pos_masks = pos_masks.permute(2, 0, 1)
             if rescale:
                 masks = F.interpolate(pos_masks.unsqueeze(0), scale_factor=scale / scale_factor, mode='bilinear',
@@ -867,134 +902,22 @@ class SipMaskMemCNPHead(nn.Module):
                                       align_corners=False).squeeze(0)
             masks.gt_(0.5)
 
-        # if det_bboxes.size(0):
-        #     masks_iou = self.mask_iou(masks, masks)
-        #     masks_iou.triu_(diagonal=1)
-        #     iou_mask, _ = torch.max(masks_iou, dim=1)
-        #     keep = (iou_mask <= 0.1) #* (boxes[:,4] > cfg.score_thr)
-        #     det_bboxes = det_bboxes[keep]
-        #     det_labels = det_labels[keep]
-        #     masks = masks[keep]
         return det_bboxes, det_labels, masks 
 
-    def extract_box_feature_center_single(self, track_feats, gt_bboxs):
-
-        track_box_feats = track_feats.new_zeros(gt_bboxs.size()[0], 512)
-
-        #####extract feature box############
-        ref_feat_stride = 8
-        gt_center_xs = torch.floor((gt_bboxs[:, 2] + gt_bboxs[:, 0]) / 2.0 / ref_feat_stride).long()
-        gt_center_ys = torch.floor((gt_bboxs[:, 3] + gt_bboxs[:, 1]) / 2.0 / ref_feat_stride).long()
-
-        aa = track_feats.permute(1, 2, 0)
-
-        #avoid cuda side error when gt_center is out of track_feats
-        gt_center_xs = torch.clamp(gt_center_xs, max=aa.shape[1]-1)
-        gt_center_ys = torch.clamp(gt_center_ys, max=aa.shape[0]-1)
-        
-        bb = aa[gt_center_ys, gt_center_xs, :]
-        track_box_feats += bb
-
-        return track_box_feats
-
-
-    def uncert_nms(self, boxes, masks, cls_scores, box_cents, cfg):
-        '''
-        boxes: [num_dets,6]; 6=[x1,y1,x2,y2,score,uncert]
-        masks: [num_dets,h,w]
-        cls_scores: [num_dets, num_classes-1]
-        box_cents: [num_dets]
-        '''
-        # comprehend_score = self.comprehensive_uncert_score(boxes, masks, cls_scores, box_cents, cfg)
-        # comprehend_score, idx = comprehend_score.sort()
-        # idx = idx[:min(cfg.max_pre_nms, idx.size(0))].contiguous()
-        # comprehend_score = comprehend_score[:min(cfg.max_pre_nms, idx.size(0))]
-        # boxes = boxes[idx]
-        # masks = masks[idx]
-        # cls_scores = cls_scores[idx]
-
-        # min_bbox = []
-        # ids = []
-        # for id, mask in enumerate(masks):
-        #     ind = mask.nonzero()
-        #     if torch.any(ind):
-        #         y1, x1 = max((ind[:,0].min()-1), 0), max((ind[:,1].min()-1), 0)
-        #         y2, x2 = min((ind[:,0].max()+1), mask.shape[0]-1), min((ind[:,1].max()+1), mask.shape[1]-1)
-        #         min_bbox.append(torch.tensor([x1, y1, x2, y2], device=mask.device))
-        #         ids.append(id)
-        # min_bbox = torch.stack(min_bbox, dim=0)
-
-        # boxes = boxes[ids]
-        # masks = masks[ids]
-        # cls_scores = cls_scores[ids]
-        # boxes[:,:4] = min_bbox
-        
-        masks_iou = self.mask_iou(masks, masks)
-        masks_iou.triu_(diagonal=1)
-        iou_mask, _ = torch.max(masks_iou, dim=1)
-
-        # iou = self.jaccard(boxes[:,:4], boxes[:,:4])
-        # iou.triu_(diagonal=1)
-        # iou_box, _ = iou.max(dim=1)
-
-        # Now just filter out the ones higher than the threshold
-        keep = (iou_mask <= 0.1) #* (boxes[:,4] > cfg.score_thr)
-
-        masks = masks[keep]
-        boxes = boxes[keep]
-        cls_scores = cls_scores[keep]
-
-        masks = masks[:cfg.max_per_img]
-        boxes = boxes[:cfg.max_per_img]
-        cls_scores = cls_scores[:cfg.max_per_img]
-
-        classes = torch.argmax(cls_scores, dim=1) 
-
-        return boxes, classes, masks
     
-    def comprehensive_uncert_score(self, boxes, masks, cls_scores, box_cents, cfg):
-        '''
-        this fun. is used to compute the comprehensive uncertainty score using
-        ratio of mask/box are, cls_score and uncertainty score
-        '''
-        # compute the mask/box area ratio
-        mask_area = masks.sum(dim=(1,2))
-        box_area = (boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])
-        mask_box_area_ratio = mask_area/box_area
-        # compute the cls_score
-        cls_score = torch.max(cls_scores, dim=1)[0]
-        uncert = boxes[:,5]
-        # compute the comprehensive uncertainty score
-        comp_uncert_score = (1-cls_score) + (1-box_cents) + (1-mask_box_area_ratio)
-        return comp_uncert_score
 
-    def mask_iou(self, masks1, masks2):
-        '''
-        masks1: [num_dets1,h,w]
-        masks2: [num_dets2,h,w]
-        masks_iou: [num_dets1,num_dets2]
-        '''
-        masks1 = masks1.unsqueeze(1).expand(-1, masks2.size(0), -1, -1).flatten(-2, -1).bool()
-        masks2 = masks2.unsqueeze(0).expand(masks1.size(0), -1, -1, -1).flatten(-2, -1).bool()
-        inter = (masks1 & masks2).float().sum(-1)
-        union = (masks1 | masks2).float().sum(-1)
-        masks_iou =  inter / torch.clamp(union, min=1e-6)
-        return masks_iou
-
-    def fast_nms(self, boxes, scores, coefs, cfg):
+    def fast_nms(self, boxes, scores, cfg):
         '''
         boxes: [num_dets,4]
         scores: [num_classes, num_dets]
-        coefs: [num_dets, nc]; 
         '''
-        scores, idx = scores.sort(1, descending=True)
-        idx = idx[:, :cfg.max_pre_nms].contiguous()
+        scores, idx_pre = scores.sort(1, descending=True)
+        idx_pre = idx_pre[:, :cfg.max_pre_nms].contiguous()
         scores = scores[:, :cfg.max_pre_nms]
 
-        num_classes, num_dets = idx.size()
+        num_classes, num_dets = idx_pre.size()
 
-        boxes = boxes[idx.view(-1), :].view(num_classes, num_dets, 4)
-        coefs = coefs[idx.view(-1), :].view(num_classes, num_dets, -1)
+        boxes = boxes[idx_pre.view(-1), :].view(num_classes, num_dets, 4)
 
         iou = self.jaccard(boxes, boxes)
         iou.triu_(diagonal=1)
@@ -1015,7 +938,6 @@ class SipMaskMemCNPHead(nn.Module):
         classes = classes[keep]
 
         boxes = boxes[keep]
-        coefs = coefs[keep]
         scores = scores[keep]
 
         # Only keep the top cfg.max_num_detections highest scores across all classes
@@ -1025,9 +947,9 @@ class SipMaskMemCNPHead(nn.Module):
 
         classes = classes[idx]
         boxes = boxes[idx]
-        coefs = coefs[idx]
+
         boxes = torch.cat([boxes, scores[:, None]], dim=1)
-        return boxes, classes, coefs, idx
+        return boxes, classes, idx_pre[keep][idx]
 
     def jaccard(self, box_a, box_b, iscrowd: bool = False):
         """Compute the jaccard overlap of two sets of boxes.  The jaccard overlap
@@ -1099,7 +1021,7 @@ class SipMaskMemCNPHead(nn.Module):
             0, h * stride, stride, dtype=dtype, device=device)
         y, x = torch.meshgrid(y_range, x_range)
         points = torch.stack(
-            (x.reshape(-1), y.reshape(-1)), dim=-1) + stride // 2
+            (x.reshape(-1), y.reshape(-1)), dim=-1) + stride / 2
         return points
 
     def xyxy2ltrb(self, bboxes, points):
@@ -1145,116 +1067,152 @@ class SipMaskMemCNPHead(nn.Module):
                 unscale_factor, 
                 mask, 
                 points_stages,
+                uncertainty=None,
                 box_cls=None,
+                box_reg=None,
+                box_gts=None,
                 cent_target=None,
                 cof_preds=None,
                 gt_label=None,
-                gt_l=None,
-                gt_t=None,
-                sigma=None,
                 mode='none'):
-        with torch.no_grad():
-            if mode == 'none':#default mode acts same as sipmask using regress range
-                offset_unnorm = closest_offset * 2*unscale_factor[None,0]
-                pos_points = torch.cat([(offset_unnorm[:points_stages[0]]<=100) & (closest_offset[:points_stages[0]]<(1.5*2/unscale_factor[None,0])),
-                                (offset_unnorm[points_stages[0]:points_stages[1]]>100) & (offset_unnorm[points_stages[0]:points_stages[1]]<=200) & (closest_offset[points_stages[0]:points_stages[1]]<(2*1.5*2/unscale_factor[None,0])),
-                                (offset_unnorm[points_stages[1]:points_stages[2]]>200) & (offset_unnorm[points_stages[1]:points_stages[2]]<=400) & (closest_offset[points_stages[1]:points_stages[2]]<(4*1.5*2/unscale_factor[None,0])),
-                                (offset_unnorm[points_stages[2]:]>400) & (closest_offset[points_stages[2]:]<(8*1.5*2/unscale_factor[None,0]))]) & mask
-                neg_points = ~pos_points
+        if mode == 'none':#default mode acts similar to FCOS/sipmask wo range
+            pos_points = torch.cat([(closest_offset[:points_stages[0]]<(1.5*8)),
+                                    (closest_offset[points_stages[0]:points_stages[1]]<(1.5*16)),
+                                    (closest_offset[points_stages[1]:points_stages[2]]<(1.5*32)),
+                                    (closest_offset[points_stages[2]:]<(1.5*64))]) & mask
+            neg_points = ~pos_points
+
+        elif mode == 'uncert':
+            with torch.no_grad():
+                uncertainty = uncertainty.clamp(max=1)
+                score = -uncertainty + cent_target
+                mask_offset = score.new_zeros(score.shape).bool()
+                sel_points = []
+                for lvl in range(len(points_stages)):
+                    start = 0 if lvl==0 else points_stages[lvl-1]
+                    end = points_stages[lvl]
+                    score_stage = score[start:end]
+                    gt_id_stage = closest_gt_ind[start:end]
+                    range_stage = torch.arange(start, end)
+                    for gt_id in gt_id_stage.unique():
+                        gt_points = (gt_id_stage==gt_id)
+                        topk = score_stage[gt_points].topk(min(4, gt_points.sum()), largest=True)[1]
+                        sel_points.append(range_stage[gt_points][topk])
+                sel_points = torch.cat(sel_points)
+                mask_offset[sel_points] = True
+                pos_points = mask_offset & mask
+                neg_points = ~pos_points & (score<0)
+
+
+        elif mode == 'eccv':
+            with torch.no_grad():
+                mask_offset = closest_offset.new_zeros(closest_offset.shape).bool()
+                sel_points = []
+                for lvl in range(len(points_stages)):
+                    start = 0 if lvl==0 else points_stages[lvl-1]
+                    end = points_stages[lvl]
+                    offset_stage = closest_offset[start:end]
+                    gt_id_stage = closest_gt_ind[start:end]
+                    range_stage = torch.arange(start, end)
+                    for gt_id in gt_id_stage.unique():
+                        gt_points = (gt_id_stage==gt_id)
+                        topk = offset_stage[gt_points].topk(min(4, gt_points.sum()), largest=False)[1]
+                        sel_points.append(range_stage[gt_points][topk])
+                sel_points = torch.cat(sel_points)
+                mask_offset[sel_points] = True
+                pos_points = mask_offset & mask
+                neg_points = ~pos_points 
                 
-            elif mode == 'objbox':#strategy from ECCV2022 objectbox
-                pos_points = (closest_offset<1.5*2/unscale_factor[None,0]) & mask 
-                neg_points = ~pos_points
+        elif mode == 'objbox':#strategy from ECCV2022 objectbox
+            pos_points = (closest_offset<1.5*2/unscale_factor[None,0]) & mask 
+            neg_points = ~pos_points
 
-            elif mode == 'dynamic' and box_cls is not None and cent_target is not None and cof_preds is not None and gt_label is not None:
-                score = box_cls * cent_target[:,None]
-                score_0 = score[:points_stages[0]] #num_points, K 
-                score_1 = score[points_stages[0]:points_stages[1]]  #num_points, K
-                score_2 = score[points_stages[1]:points_stages[2]]  #num_points, K
-                score_3 = score[points_stages[2]:]  #num_points, K
-                score_0 = score_0.view(cof_preds[0].shape[2], cof_preds[0].shape[3], -1) #H, W, K
-                score_1 = F.interpolate(score_1.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[1].shape[2], cof_preds[1].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0) #H, W, K
-                score_2 = F.interpolate(score_2.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[2].shape[2], cof_preds[2].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
-                score_3 = F.interpolate(score_3.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[3].shape[2], cof_preds[3].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
-                
-                gt_label =  gt_label[closest_gt_ind[:points_stages[0]].view(-1,1)]-1
-                score_0 = score_0.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-                score_1 = score_1.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-                score_2 = score_2.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-                score_3 = score_3.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
-                stage_assign = torch.stack([score_0, score_1, score_2, score_3], dim=1) #points, stages
-
-                stage_mean = stage_assign.mean(1, keepdim=True)
-                stage_assign = (stage_assign >= stage_mean)
-                stage_assign_0 = stage_assign[:,0].flatten()
-                stage_assign_1 = F.interpolate((stage_assign[:,1].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[1].shape[2], cof_preds[1].shape[3]), mode='nearest').bool().flatten()
-                stage_assign_2 = F.interpolate((stage_assign[:,2].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[2].shape[2], cof_preds[2].shape[3]), mode='nearest').bool().flatten()
-                stage_assign_3 = F.interpolate((stage_assign[:,3].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[3].shape[2], cof_preds[3].shape[3]), mode='nearest').bool().flatten()
-
-                pos_0 = (closest_offset[:points_stages[0]]<np.sqrt(2)*2/unscale_factor[None,0]) & stage_assign_0
-                pos_1 = (closest_offset[points_stages[0]:points_stages[1]]<np.sqrt(2)*2**2/unscale_factor[None,0]) & stage_assign_1
-                pos_2 = (closest_offset[points_stages[1]:points_stages[2]]<np.sqrt(2)*2**3/unscale_factor[None,0]) & stage_assign_2
-                pos_3 = (closest_offset[points_stages[2]:]<np.sqrt(2)*2**4/unscale_factor[None,0]) & stage_assign_3
-
-                pos_points = torch.cat([pos_0, pos_1, pos_2, pos_3], dim=0)
-                neg_points = ~pos_points
+        elif mode == 'dynamic' and box_cls is not None and cent_target is not None and cof_preds is not None and gt_label is not None:
+            score = box_cls.sigmoid() * cent_target[:,None]
+            score_0 = score[:points_stages[0]] #num_points, K 
+            score_1 = score[points_stages[0]:points_stages[1]]  #num_points, K
+            score_2 = score[points_stages[1]:points_stages[2]]  #num_points, K
+            score_3 = score[points_stages[2]:]  #num_points, K
+            score_0 = score_0.view(cof_preds[0].shape[2], cof_preds[0].shape[3], -1) #H, W, K
+            score_1 = F.interpolate(score_1.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[1].shape[2], cof_preds[1].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0) #H, W, K
+            score_2 = F.interpolate(score_2.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[2].shape[2], cof_preds[2].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
+            score_3 = F.interpolate(score_3.transpose(0,1).unsqueeze(0).view(1, -1, cof_preds[3].shape[2], cof_preds[3].shape[3]), size=(cof_preds[0].shape[2], cof_preds[0].shape[3]), mode='bilinear', align_corners=True).squeeze(0).permute(1,2,0)  #H, W, K
             
-            elif mode == 'posneg' and gt_l is not None and gt_t is not None:
-                pos_points = ((closest_offset<(gt_t[closest_gt_ind]*0.2)) & (closest_offset<(gt_l[closest_gt_ind]*0.2))) 
-                neg_points = (closest_offset>(gt_t[closest_gt_ind]*0.6)) & (closest_offset>(gt_l[closest_gt_ind]*0.6)) & ~mask
+            gt_label =  gt_label[closest_gt_ind[:points_stages[0]].view(-1,1)]-1
+            score_0 = score_0.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
+            score_1 = score_1.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
+            score_2 = score_2.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
+            score_3 = score_3.flatten(0,1).gather(1, gt_label).squeeze(1) #points stage_0
+            stage_assign = torch.stack([score_0, score_1, score_2, score_3], dim=1) #points, stages
 
-            elif mode == 'uncertainty' and sigma is not None:
-                offset_unnorm = closest_offset * 2*unscale_factor[None,0]
-                top_k_mu = torch.topk(sigma[:,0], k=int(0.01*sigma.size(0)), dim=0, largest=False)[0][-1]
-                pos_points = torch.cat([(offset_unnorm[:points_stages[0]]<=100) & (sigma[:points_stages[0],0]<top_k_mu),
-                                (offset_unnorm[points_stages[0]:points_stages[1]]>100) & (offset_unnorm[points_stages[0]:points_stages[1]]<=200) & (sigma[points_stages[0]:points_stages[1],0]<top_k_mu),
-                                (offset_unnorm[points_stages[1]:points_stages[2]]>200) & (offset_unnorm[points_stages[1]:points_stages[2]]<=400) & (sigma[points_stages[1]:points_stages[2],0]<top_k_mu),
-                                (offset_unnorm[points_stages[2]:]>400) & (sigma[points_stages[2]:,0]<top_k_mu)]) & mask
-                neg_points = ~pos_points
+            stage_mean = stage_assign.mean(1, keepdim=True)
+            stage_assign = (stage_assign >= stage_mean)
+            stage_assign_0 = stage_assign[:,0].flatten()
+            stage_assign_1 = F.interpolate((stage_assign[:,1].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[1].shape[2], cof_preds[1].shape[3]), mode='nearest').bool().flatten()
+            stage_assign_2 = F.interpolate((stage_assign[:,2].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[2].shape[2], cof_preds[2].shape[3]), mode='nearest').bool().flatten()
+            stage_assign_3 = F.interpolate((stage_assign[:,3].view(cof_preds[0].shape[2:])[None,None,:]).float(), size=(cof_preds[3].shape[2], cof_preds[3].shape[3]), mode='nearest').bool().flatten()
 
-            else:
-                raise NotImplementedError
-            return pos_points, neg_points
+            pos_0 = (closest_offset[:points_stages[0]]<np.sqrt(2)*2/unscale_factor[None,0]) & stage_assign_0
+            pos_1 = (closest_offset[points_stages[0]:points_stages[1]]<np.sqrt(2)*2**2/unscale_factor[None,0]) & stage_assign_1
+            pos_2 = (closest_offset[points_stages[1]:points_stages[2]]<np.sqrt(2)*2**3/unscale_factor[None,0]) & stage_assign_2
+            pos_3 = (closest_offset[points_stages[2]:]<np.sqrt(2)*2**4/unscale_factor[None,0]) & stage_assign_3
+
+            pos_points = torch.cat([pos_0, pos_1, pos_2, pos_3], dim=0)
+            neg_points = ~pos_points
+        
+        else:
+            raise NotImplementedError
+        return pos_points, neg_points
     
     def cnp_scoreing_rule(self, 
                           gt_ids, 
                           mu, 
                           sigma, 
                           cent_target, 
+                          tgt_uncert,
                           gts, 
-                          mask,
-                          mode='GMM'):
+                          pos_points,
+                          mode='NLL'):
         loss = 0
         if mode == 'GMM':
             for gt_id in gt_ids[:,1].unique():
-                sup_ind = gt_ids[:,1]==gt_id
-                sup_ind = gt_ids[sup_ind][:,0]
+                gt_ind = gt_ids[:,1]==gt_id
+                sup_ind = gt_ids[gt_ind][:,0]
                 sup_mu = mu[sup_ind]
                 sup_sigma = sigma[sup_ind]
-                # dist = MultivariateNormal(sup_mu, torch.diag_embed(sup_sigma))
+                tgt_sigma = tgt_uncert[gt_ind]
                 dist = Independent(Normal(sup_mu, sup_sigma), 1)#num_valid_dt
                 weight = cent_target[sup_ind]+1e-9 #num_valid_dt
                 gmm = MixtureSameFamily(Categorical(weight), dist)
                 gt_mu = gts[gt_id]
-                loss += -gmm.log_prob(gt_mu).mean()/mask.numel()
+                loss += -gmm.log_prob(gt_mu).mean()/pos_points.numel() + F.smooth_l1_loss(sup_sigma, tgt_sigma[:,None])
             
 
         elif mode == 'NLL':
-            if gt_ids[:,1].numel():
-                dist = Independent(Normal(mu[gt_ids[:,0]], sigma[gt_ids[:,0]]), 1)
-                loss += -dist.log_prob(gts[gt_ids[:,1]]).mean()/gt_ids[:,1].numel()
+            for gt_id in gt_ids[:,1].unique():
+                gt_ind = gt_ids[:,1]==gt_id
+                sup_ind = gt_ids[gt_ind][:,0]
+                sup_mu = mu[sup_ind]
+                sup_sigma = sigma[sup_ind]-0.1
+                tgt_sigma = tgt_uncert[gt_ind]
+                dist = Independent(Normal(sup_mu, sup_sigma), 1)#num_valid_dt
+                gt_mu = gts[gt_id]
+                loss += -dist.log_prob(gt_mu).mean()/pos_points.numel() + F.smooth_l1_loss(sup_sigma, tgt_sigma[:,None])
 
         elif mode == 'ES':
             for gt_id in gt_ids[:,1].unique():
-                sup_ind = gt_ids[:,1]==gt_id
-                sup_ind = gt_ids[sup_ind][:,0]
+                gt_ind = gt_ids[:,1]==gt_id
+                sup_ind = gt_ids[gt_ind][:,0]
                 sup_mu = mu[sup_ind]
-                sup_sigma = sigma[sup_ind]
+                sup_sigma = sigma[sup_ind]-0.1
+                tgt_sigma = tgt_uncert[gt_ind]
                 gt_mu = gts[gt_id]
                 dist = Independent(Normal(sup_mu, sup_sigma), 1)
-                samples = dist.sample(torch.Size([128])).mean(1) # (averaging batch dim) k samples, evnet_dim
-                loss += (samples-gt_mu[None,:]).abs().mean() - 0.5*(samples[:,None,:]-samples[None,:,:]).abs().mean()
-                loss /= gt_ids[:,1].numel()
+                samples = dist.rsample(torch.Size([128])).mean(1) # (averaging batch dim) k samples, evnet_dim
+                es = ((samples-gt_mu[None,:]).abs().mean() - 0.5*(samples[:-1,:]-samples[1:,:]).abs().mean())/pos_points.numel() 
+                reg = F.smooth_l1_loss(sup_sigma, tgt_sigma[:,None])
+                loss += (es + reg)
+
 
         elif mode == 'contrast':
             for gt_id in gt_ids[:,1].unique():
@@ -1265,7 +1223,7 @@ class SipMaskMemCNPHead(nn.Module):
 
                 dist = Independent(Normal(mu, sigma), 1)
                 log_prob = dist.log_prob(gts[gt_id].unsqueeze(0)) # dt_num
-                loss += -(log_prob[sup_ind].sum())/(log_prob[mask].sum()+1e-9).mean()
+                loss += -(log_prob[sup_ind].sum())/(log_prob[pos_points].sum()+1e-9).mean()
                 loss /= gt_ids[:,1].numel()
 
 
@@ -1274,3 +1232,37 @@ class SipMaskMemCNPHead(nn.Module):
             raise NotImplementedError
 
         return loss
+    
+    def get_reg_cls_target_single(self, gt_bbox, points):
+        with torch.no_grad():
+            gt_ltrb = self.xyxy2ltrb(gt_bbox, points) # num_points, num_gt, 4
+            areas = (gt_ltrb[..., 2] + gt_ltrb[..., 0]) * (gt_ltrb[..., 3] + gt_ltrb[..., 1]) # num_points
+            inside_gt_bbox = gt_ltrb.min(-1)[0] > 0 #num_points, num_gt
+            areas[inside_gt_bbox == 0] = -INF
+            min_area, min_area_inds = areas.min(dim=1)
+            mask = min_area > 1
+            ltrb_unique = gt_ltrb[range(gt_ltrb.size(0)), min_area_inds] # num_points, 4
+            # x1y1 = points - ltrb_unique[..., :2] # num_points, 2
+            # x2y2 = points + ltrb_unique[..., 2:] # num_points, 2
+            # gt_xyxy = torch.cat([x1y1, x2y2], dim=-1) # num_points, 4
+            return ltrb_unique, mask
+    
+    
+    def extract_box_feature_center_single(self, track_feats, gt_bboxs):
+        track_box_feats = track_feats.new_zeros(gt_bboxs.size()[0], track_feats.size(0))
+
+        #####extract feature box############
+        ref_feat_stride = 8
+        gt_center_xs = torch.floor((gt_bboxs[:, 2] + gt_bboxs[:, 0]) / 2.0 / ref_feat_stride).long()
+        gt_center_ys = torch.floor((gt_bboxs[:, 3] + gt_bboxs[:, 1]) / 2.0 / ref_feat_stride).long()
+
+        aa = track_feats.permute(1, 2, 0)
+
+        #avoid cuda side error when gt_center is out of track_feats
+        gt_center_xs = torch.clamp(gt_center_xs, max=aa.shape[1]-1)
+        gt_center_ys = torch.clamp(gt_center_ys, max=aa.shape[0]-1)
+        
+        bb = aa[gt_center_ys, gt_center_xs, :]
+        track_box_feats += bb
+
+        return track_box_feats

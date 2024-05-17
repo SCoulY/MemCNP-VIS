@@ -139,4 +139,9 @@ dmypy.json
 *.png
 
 #tfrecords
-events.out*
+events.out
+
+# test results
+*.json
+*.pkl
+*.zip
