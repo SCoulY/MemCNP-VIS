@@ -33,7 +33,7 @@ Some results can be seen below:
 </tr>
 </table>
 
-For more details about the dataset, please refer to our [paper](https://arxiv.org/abs/2102.01558).
+For more details about the dataset, please refer to our paper.
 
 ## Model training and evaluation
 
