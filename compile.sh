@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 PYTHON='python'
-export CUDA_HOME='/usr/local/cuda-11-2/'
+export CUDA_HOME='/usr/local/cuda-11.7/'
 export PATH=/usr/local/cuda-11-2/bin:$PATH
-export LD_LIBRARY_PATH="/usr/local/cuda-11-2/lib64":$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH="/usr/local/cuda-11.7/lib64":$LD_LIBRARY_PATH
 
 
 cd mmdet/ops/roi_align
@@ -56,9 +56,3 @@ if [ -d "build" ]; then
 fi
 $PYTHON setup.py build_ext --inplace
 
-echo "Building cocoapi..."
-cd ..
-if [ -d "build" ]; then
-    rm -r build
-fi
-$PYTHON setup.py install
