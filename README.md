@@ -49,7 +49,10 @@ conda env create -f env_conda.yml
 conda activate memcnp
 
 pip install -r env_pip.txt
-pip install git+https://github.com/qjy981010/cocoapi.git#"egg=pycocotools&subdirectory=PythonAPI"
+git clone https://github.com/qjy981010/cocoapi.git /tmp/cocoapi 
+cd /tmp/cocoapi/PythonAPI 
+python setup.py install 
+cd -
 conda install six matplotlib
 ```
 
