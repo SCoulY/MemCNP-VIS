@@ -48,9 +48,8 @@ Modify ``cuda`` and corresponding ``torch`` version.
 conda env create -f env_conda.yml
 conda activate memcnp
 
-conda install -c pytorch pytorch=1.3.1 torchvision=0.2.2 cudatoolkit=10.0 -y
 pip install -r env_pip.txt
-pip install git+https://github.com/youtubevos/cocoapi.git#"egg=pycocotools&subdirectory=PythonAPI"
+pip install git+https://github.com/qjy981010/cocoapi.git#"egg=pycocotools&subdirectory=PythonAPI"
 conda install six matplotlib
 ```
 
@@ -97,7 +96,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -u train.py configs/vitmae_cnp_contrast_ms_1
 To change training configurations such as learning rate, model parameters, and dataset, please refer to `vitmae_cnp_contrast_ms_1x.py`.
 
 ### Evaluation
-Our pretrained model is available for download at [Google Drive](https://drive.google.com/file/d/1MOV12JM1IXW16AU6_2UyvaxcyCxJlJkv/view?usp=sharing).
+Our pretrained model is available for download at [Google Drive](https://drive.google.com/file/d/1fUgaEtMw2H-KGVQqrOUnHPvLiOWqYle8/view?usp=drive_link).
 Run the following command to evaluate the model on YVIS.
 ```
 CUDA_VISIBLE_DEVICES=0 python test_video.py configs/vitmae_cnp_contrast_ms_1x.py [MODEL_PATH] --out [OUTPUT_PATH.pkl] --eval segm
