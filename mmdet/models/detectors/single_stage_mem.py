@@ -62,20 +62,18 @@ class SingleStageMem(BaseDetector):
             x = checkpoint.checkpoint(self.extract_feat, img)
             x_f = checkpoint.checkpoint(self.extract_feat, ref_img)
         
-
         outs = self.bbox_head(x, x_f, gt_bboxes, gt_labels)
-
 
         loss_inputs = outs + (gt_bboxes, gt_labels, img_metas, self.train_cfg)
         losses, tf_logs = self.bbox_head.loss(
             *loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore, gt_masks_list=gt_masks, ref_bboxes_list = ref_bboxes, gt_pids_list=gt_pids)
         
-        tf_logs['img']=img[0].detach().cpu()
-        for key in tf_logs.keys():
-            if key in ['mask_shape_list', 'img_metas']:
-                continue
-            else:
-                tf_logs[key]=tf_logs[key].detach().cpu()
+        # tf_logs['img']=img[0].detach().cpu()
+        # for key in tf_logs.keys():
+        #     if key in ['mask_shape_list', 'img_metas']:
+        #         continue
+        #     else:
+        #         tf_logs[key]=tf_logs[key].detach().cpu() ### Not sure why this failed in DDP yet. Needs further debugging
 
         return losses, tf_logs
 

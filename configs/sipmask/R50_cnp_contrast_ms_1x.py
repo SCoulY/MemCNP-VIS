@@ -2,7 +2,7 @@
 
 model = dict(
     type='SipMaskMem',
-    pretrained='https://download.openmmlab.com/pretrain/third_party/resnet50_caffe-788b5fa3.pth',
+    pretrained='/local/disk_6tb/MemCNP-VIS/ckpt/res50/resnet50_caffe-788b5fa3.pth',
     backbone=dict(
         type='ResNet',
         depth=50,
@@ -27,7 +27,6 @@ model = dict(
         stacked_convs=3,
         feat_channels=256,
         strides=[8, 16, 32, 64],
-        regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 1e8)),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
@@ -52,8 +51,7 @@ model = dict(
             kdim=128, 
             moving_average_rate=0.999,
             update_mode='top1'),
-        center_sampling=True,
-        center_sample_radius=1.5))
+        ))
 # training and testing settings
 train_cfg = dict(
     assigner=dict(
@@ -64,7 +62,7 @@ train_cfg = dict(
     debug=False)
 
 test_cfg = dict(
-    min_bbox_size=1,
+    min_bbox_size=9,
     score_thr=0.03,
     nms=dict(type='nms', iou_thr=0.5),
     max_pre_nms=200,
@@ -73,7 +71,7 @@ test_cfg = dict(
 
 # dataset settings
 dataset_type = 'YVISDataset'
-data_root = '/media/data/coky/OVIS/data/yvis/'
+data_root = '/local/disk_6tb/MemCNP-VIS/data/yvis/'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 data = dict(
@@ -117,7 +115,7 @@ data = dict(
 # optimizer
 optimizer = dict(
     type='SGD',
-    lr=0.005,
+    lr=0.001,
     momentum=0.9,
     weight_decay=0.0001
     )
@@ -134,13 +132,13 @@ checkpoint_config = dict(interval=1)
 log_config = dict(
     interval=50,
     hooks=[
-        dict(type='TextLoggerHook'),
-        dict(type='TBImgLoggerHook', 
-             interval=50,
-             plot_img_bbox=True,
-             plot_memory=True,
-             plot_neg_bbox=True,
-             )
+        dict(type='TextLoggerHook')
+        # dict(type='TBImgLoggerHook', 
+        #      interval=50,
+        #      plot_img_bbox=False,
+        #      plot_memory=False,
+        #      plot_neg_bbox=False,
+        #      )
     ])
 cnp_mem_config = None
 

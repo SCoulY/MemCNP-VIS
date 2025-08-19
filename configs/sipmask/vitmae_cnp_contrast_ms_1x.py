@@ -2,7 +2,7 @@
 
 model = dict(
     type='SipMaskMem',
-    pretrained='/media/data/coky/OVIS/CMaskTrack-RCNN/workdir/ViT-b_sipmask/mae_pretrain_vit_b.pth',
+    pretrained='/local/disk_6tb/MemCNP-VIS/ckpt/vit-b/mae_pretrain_vit-b.pth',
     backbone=dict(
         type='ViT',
         patch_size=16, 
@@ -76,7 +76,7 @@ test_cfg = dict(
 
 # dataset settings
 dataset_type = 'YVISDataset'
-data_root = '/media/data/coky/OVIS/data/yvis/'
+data_root = '/local/disk_6tb/MemCNP-VIS/data/yvis/'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 data = dict(
@@ -120,7 +120,7 @@ data = dict(
 # optimizer
 optimizer = dict(
     type='SGD',
-    lr=0.01,
+    lr=0.001,
     momentum=0.9,
     weight_decay=0.0001
     )
