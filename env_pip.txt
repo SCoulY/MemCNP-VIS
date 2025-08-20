@@ -14,7 +14,6 @@ imgaug==0.4.0
 importlib-metadata==4.8.3
 markdown==3.3.6
 mmcv==1.4.7
-mmdet==0.6.0
 networkx==2.5.1
 numpy==1.19.2
 oauthlib==3.2.0
@@ -23,7 +22,6 @@ pillow==8.4.0
 protobuf==3.19.4
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
-pycocotools==2.0.6
 pycparser==2.21
 pyparsing==3.0.4
 pywavelets==1.1.1
