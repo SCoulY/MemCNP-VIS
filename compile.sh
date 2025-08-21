@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 PYTHON='python'
-export TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6"
+export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6"
 
-# export CUDA_HOME='/usr/local/cuda-11.5/'
-# export PATH=/usr/local/cuda-11-5/bin:$PATH
-# export LD_LIBRARY_PATH="/usr/local/cuda-11.5/lib64":$LD_LIBRARY_PATH
+export CUDA_HOME='/usr/local/cuda-11.8/'
+export PATH=/usr/local/cuda-11-8/bin:$PATH
+export LD_LIBRARY_PATH="/usr/local/cuda-11.8/lib64":$LD_LIBRARY_PATH
 
 
 
