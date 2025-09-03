@@ -2,7 +2,7 @@
 
 This repo serves as the official code release of the MemCNP-VIS model in the paper:
 
-## [A Memory-based Conditional Neural Process for Video Instance Segmentation](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4630924)
+## [A Memory-based Conditional Neural Process for Video Instance Segmentation](https://doi.org/10.1016/j.neucom.2025.131439)
 
 
 Some results can be seen below:
@@ -124,9 +124,15 @@ This project is based on [MaskTrack-RCNN](https://github.com/youtubevos/MaskTrac
 If you find our paper and code useful in your research, please consider giving a star ⭐ and citation 📝 :
 
 ```
-@article{yuan4630924memory,
-  title={A Memory-Based Conditional Neural Process for Video Instance Segmentation},
-  author={Yuan, Kunhao and Schaefer, Gerald and Lai, Yu-Kun and Liu, Xiyao and Guan, Lin and Fang, Hui},
-  journal={Available at SSRN 4630924}
+@article{YUANMemCNP-VIS
+title = {A memory-based conditional neural process for video instance segmentation},
+journal = {Neurocomputing},
+volume = {655},
+pages = {131439},
+year = {2025},
+issn = {0925-2312},
+doi = {https://doi.org/10.1016/j.neucom.2025.131439},
+url = {https://www.sciencedirect.com/science/article/pii/S0925231225021113},
+author = {Kunhao Yuan and Gerald Schaefer and Yu-Kun Lai and Xiyao Liu and Lin Guan and Hui Fang}
 }
 ```
