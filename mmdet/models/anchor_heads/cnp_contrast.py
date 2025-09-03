@@ -111,6 +111,11 @@ class CNPContrastHead(nn.Module):
         self.prev_det_labels = None
         self.mem = MemoryN2N(hdim=self.in_channels, kdim=memory_cfg['kdim'],
                              moving_average_rate=memory_cfg['moving_average_rate'])
+        
+        # Add memory management parameters
+        self.max_track_objects = 500  # Maximum number of tracked objects to prevent unbounded growth
+        self.memory_cleanup_interval = 100  # Clean up tracking memory every N iterations
+        self.iteration_count = 0
 
         self.cls_align = FeatureAlign(2*self.feat_channels, self.feat_channels, 3)
         self.mask_align = FeatureAlign(self.feat_channels, self.feat_channels, 3)
@@ -199,6 +204,28 @@ class CNPContrastHead(nn.Module):
         self.cls_align.init_weights()
         self.mask_align.init_weights()
 
+    def _cleanup_tracking_memory(self):
+        """Cleanup tracking memory to prevent unbounded growth"""
+        if self.prev_roi_feats is not None and self.prev_roi_feats.size(0) > self.max_track_objects:
+            # Keep only the most recent objects to prevent memory accumulation
+            keep_indices = torch.arange(self.prev_roi_feats.size(0) - self.max_track_objects // 2, 
+                                      self.prev_roi_feats.size(0))
+            self.prev_roi_feats = self.prev_roi_feats[keep_indices].detach()
+            self.prev_bboxes = self.prev_bboxes[keep_indices].detach()
+            self.prev_det_labels = self.prev_det_labels[keep_indices].detach()
+            
+            # Force garbage collection
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def reset_tracking_memory(self):
+        """Reset tracking memory - useful for new sequences"""
+        self.prev_roi_feats = None
+        self.prev_bboxes = None
+        self.prev_det_labels = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 
     def forward(self, feats, feats_x, gt_bboxes=None, flag_train=True):
@@ -210,6 +237,11 @@ class CNPContrastHead(nn.Module):
         feat_centers = []
         rel_pos_maps = []
         count = 0
+
+        # Increment iteration counter and perform periodic memory cleanup
+        self.iteration_count += 1
+        if self.iteration_count % self.memory_cleanup_interval == 0:
+            self._cleanup_tracking_memory()
 
         shape_h, shape_w = feats[0].shape[2:]
         unscale_factor = torch.tensor([8*shape_w, 8*shape_h, 8*shape_w, 8*shape_h], 
@@ -542,7 +574,7 @@ class CNPContrastHead(nn.Module):
 
             # pred_masks_crop = self.crop_feat(pred_mask, bbox_dt) #num_dt_boxes, points
             # gt_masks_crop = self.crop_feat(gt_mask_new, bbox_dt) #num_dt_boxes, points
-            pos_get_csize = center_size(bbox_dt)
+            pos_get_csize = center_size(bbox_dt.detach())
             gt_box_width = pos_get_csize[:, 2]
             gt_box_height = pos_get_csize[:, 3]
             weighted_loss_seg = F.binary_cross_entropy(pred_masks_crop, gt_masks_crop, reduction='none').sum((0,1)) / gt_box_width / gt_box_height / pos_get_csize.shape[0]
@@ -576,7 +608,7 @@ class CNPContrastHead(nn.Module):
             neg_vecs_ref.append(track_vec_ref) #c,k
 
             dummy = track_vec_i.new_zeros(track_vec_i.size(1),1) #q,1
-            sim_mat = F.cosine_similarity(track_vec_i[:,:,None], track_vec_ref[:,None,:], 0) #q,k
+            sim_mat = F.cosine_similarity(track_vec_i[:,:,None], track_vec_ref[:,None,:], 0)/0.1 #q,k
             sim_mat = torch.cat([dummy, sim_mat], dim=1) #q,k+1
             
             n_total += len(idx_gt)
@@ -596,10 +628,10 @@ class CNPContrastHead(nn.Module):
             sim_intra = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs[:,None,:], 0)  / 0.1 #q,q
             n = sim_intra.size(0)
             sim_intra = sim_intra.flatten()[1:].view(n-1, n+1)[:,:-1].reshape(n, n-1) #q,q-1 keep only off-diagonal
-            sim_intra = sim_intra.topk(min(5*feat_masks.size(0), sim_intra.size(1)), dim=1)[0] #q, topk
+            sim_intra = sim_intra.topk(min(5, sim_intra.size(1)), dim=1)[0] #q, topk
 
             sim_inter = F.cosine_similarity(neg_vecs[:,:,None], neg_vecs_ref[:,None,:], 0) / 0.1 #q,K
-            sim_inter = sim_inter.topk(min(5*feat_masks.size(0), sim_inter.size(1)), dim=1)[0] #q, topk
+            sim_inter = sim_inter.topk(min(5, sim_inter.size(1)), dim=1)[0] #q, topk
 
             sim_neg = torch.cat([sim_intra.flatten(), sim_inter.flatten()], dim=0)  
 
@@ -622,17 +654,17 @@ class CNPContrastHead(nn.Module):
             loss_match = loss_match/len(matched_num)
 
         # default fallback - one box of zeros (or you can pick gt_bboxes[0] if preferred)
-        fallback_dt_boxes = gt_bboxes[0] if gt_bboxes and gt_bboxes[0].numel() else unscaled_dt.new_zeros((1,4))
+        # fallback_dt_boxes = gt_bboxes[0] if gt_bboxes and gt_bboxes[0].numel() else unscaled_dt.new_zeros((1,4))
 
-        # matched_ids may not have index 0 on this device
-        if 0 in matched_ids and matched_ids[0][0].numel() > 0:
-            dt_idx = matched_ids[0][0]
-            dt_boxes_safe = unscaled_dt[0][dt_idx, :]
-        else:
-            dt_boxes_safe = fallback_dt_boxes
+        # # matched_ids may not have index 0 on this device
+        # if 0 in matched_ids and matched_ids[0][0].numel() > 0:
+        #     dt_idx = matched_ids[0][0]
+        #     dt_boxes_safe = unscaled_dt[0][dt_idx, :]
+        # else:
+        #     dt_boxes_safe = fallback_dt_boxes
 
-        # Ensure dt_boxes_safe is always a tensor (same dtype/device)
-        dt_boxes_safe = dt_boxes_safe.detach() if torch.is_tensor(dt_boxes_safe) else fallback_dt_boxes
+        # # Ensure dt_boxes_safe is always a tensor (same dtype/device)
+        # dt_boxes_safe = dt_boxes_safe.detach() if torch.is_tensor(dt_boxes_safe) else fallback_dt_boxes
 
         # Build the log dict robustly
         loss_dict = dict(
@@ -652,6 +684,11 @@ class CNPContrastHead(nn.Module):
         # ) ### Not sure why this failed in DDP yet. Needs further debugging
         log_dict = {}
         out = (loss_dict, log_dict)
+
+        # Clean up intermediate variables to prevent memory accumulation
+        del matched_ids, pos_pairs, neg_vecs, neg_vecs_ref
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return out
 
@@ -762,27 +799,29 @@ class CNPContrastHead(nn.Module):
             if is_first or (not is_first and self.prev_bboxes is None):
                 det_obj_ids = np.arange(res_det_bboxes.size(0))
                 # save bbox and features for later matching
-                self.prev_bboxes = det_bboxes[0]
-                self.prev_roi_feats = det_roi_feats
-                self.prev_det_labels = det_labels
+                self.prev_bboxes = det_bboxes[0].detach()
+                self.prev_roi_feats = det_roi_feats.detach()
+                self.prev_det_labels = det_labels.detach()
             else:
 
                 assert self.prev_roi_feats is not None
                 # only support one image at a time
                 # prod = torch.mm(det_roi_feats, self.prev_roi_feats.transpose(0,1)) #n,m
-                prod = F.cosine_similarity(det_roi_feats[:,None,:], self.prev_roi_feats[None,:,:], dim=-1)/0.1 #n,m
-                dummy = torch.zeros(prod.size(0), 1, device=torch.cuda.current_device())
-                match_score = torch.cat([dummy, prod], dim=1)
-                match_logprob = torch.nn.functional.log_softmax(match_score, dim=1)
-                label_delta = (self.prev_det_labels == det_labels.view(-1, 1)).float()
-                bbox_ious = bbox_overlaps(det_bboxes[0][:, :4], self.prev_bboxes[:, :4])
-                # compute comprehensive score
-                comp_scores = self.compute_comp_scores(match_logprob,
-                                                       det_bboxes[0][:, 4].view(-1, 1),
-                                                       bbox_ious,
-                                                       label_delta,
-                                                       add_bbox_dummy=True)
-                match_likelihood, match_ids = torch.max(comp_scores, dim=1)
+                with torch.no_grad():  # Prevent gradient accumulation
+                    prod = F.cosine_similarity(det_roi_feats[:,None,:], self.prev_roi_feats[None,:,:], dim=-1)/0.1 #n,m
+                    dummy = torch.zeros(prod.size(0), 1, device=prod.device)
+                    match_score = torch.cat([dummy, prod], dim=1)
+                    match_logprob = torch.nn.functional.log_softmax(match_score, dim=1)
+                    label_delta = (self.prev_det_labels == det_labels.view(-1, 1)).float()
+                    bbox_ious = bbox_overlaps(det_bboxes[0][:, :4], self.prev_bboxes[:, :4])
+                    # compute comprehensive score
+                    comp_scores = self.compute_comp_scores(match_logprob,
+                                                           det_bboxes[0][:, 4].view(-1, 1),
+                                                           bbox_ious,
+                                                           label_delta,
+                                                           add_bbox_dummy=True)
+                    match_likelihood, match_ids = torch.max(comp_scores, dim=1)
+                
                 # translate match_ids to det_obj_ids, assign new id to new objects
                 # update tracking features/bboxes of exisiting object,
                 # add tracking features/bboxes of new object
@@ -891,7 +930,7 @@ class CNPContrastHead(nn.Module):
         combined_scores = mlvl_scores * mlvl_cents[:, None] #num_dt_boxes, C
         det_bboxes, det_labels, idx = self.fast_nms(mlvl_bboxs, combined_scores.transpose(0,1), cfg)
         # each det_box is of shape [x1,y1,x2,y2,score,uncert,centerness]
-        det_bboxes = torch.cat([det_bboxes, mlvl_uncert[idx]-0.1, mlvl_cents[idx].unsqueeze(1)], dim=1) 
+        det_bboxes = torch.cat([det_bboxes, mlvl_uncert[idx], mlvl_cents[idx].unsqueeze(1)], dim=1) 
 
  
         masks = []
@@ -1107,7 +1146,7 @@ class CNPContrastHead(nn.Module):
                     for gt_id in gt_id_stage.unique():
                         gt_points = (gt_id_stage==gt_id)
                         ### USS topk selection
-                        topk = score_stage[gt_points].topk(min(7, gt_points.sum()), largest=True)[1]
+                        topk = score_stage[gt_points].topk(min(4, gt_points.sum()), largest=True)[1]
                         sel_points.append(range_stage[gt_points][topk])
                 sel_points = torch.cat(sel_points)
                 mask_offset[sel_points] = True
